@@ -622,71 +622,162 @@ _export_cache: dict = {}
 _export_cache_time: float = 0.0
 _export_scan_lock: asyncio.Lock | None = None  # initialised in main()
 
+# Captured getActivities XHR endpoint — populated on the first export-page load.
+# Once set, all subsequent polls bypass Playwright and call it directly via httpx.
+_activities_endpoint: dict = {}  # {"url": str, "headers": dict}
 
-async def scan_export_page(context: BrowserContext, logger: logging.Logger) -> list[dict]:
-    """
-    Navigates to the export page and parses all rows from the server-rendered
-    DataTable, paginating through multiple pages as needed.
 
-    Each record: {"job_id", "source_name", "status", "download_url"}.
-    download_url is an absolute URL for completed jobs, empty string otherwise.
+def _parse_activity_item(item: dict) -> dict:
     """
+    Convert a single getActivities JSON row into the standard record dict.
+    Uses multiple field-name fallbacks to handle Backupify API variations.
+    """
+    job_id = str(
+        item.get("id") or item.get("jobId") or item.get("job_id") or ""
+    ).strip() or None
+
+    source_name = re.sub(r"<[^>]+>", "", str(
+        item.get("sourceName") or item.get("source_name") or
+        item.get("name") or item.get("source") or ""
+    )).strip()
+
+    details = item.get("details") or {}
+    if isinstance(details, str):
+        try:
+            details = json.loads(details)
+        except Exception:
+            details = {}
+
+    status = str(
+        item.get("status") or details.get("status") or
+        item.get("state") or details.get("state") or ""
+    ).lower()
+
+    download_url = str(
+        item.get("downloadUrl") or item.get("download_url") or
+        details.get("downloadUrl") or details.get("download_url") or
+        item.get("exportUrl") or ""
+    ).strip()
+    if download_url and not download_url.startswith("http"):
+        download_url = BASE_URL + download_url
+
+    return {
+        "job_id":       job_id,
+        "source_name":  source_name,
+        "status":       status,
+        "download_url": download_url,
+    }
+
+
+async def _fetch_activities_httpx(cookies: dict, logger: logging.Logger) -> list[dict]:
+    """
+    Fetches all export activity rows directly from the getActivities endpoint
+    via httpx, paginating until all records are retrieved.
+    """
+    url = _activities_endpoint["url"]
+    headers = dict(_activities_endpoint["headers"])
+    headers["cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+    records: list[dict] = []
+    start = 0
+    page_size = 100  # larger than the browser uses to reduce round trips
+    draw = 1
+
+    async with httpx.AsyncClient(follow_redirects=False, timeout=60.0) as client:
+        while True:
+            body = (
+                f"start={start}&length={page_size}&draw={draw}"
+                f"&shouldIncludeDetails=true&appType=office365_exchange&activityType=export"
+            )
+            try:
+                resp = await client.post(url, content=body.encode(), headers=headers)
+            except httpx.RequestError as e:
+                logger.warning(f"getActivities request failed: {e}")
+                break
+
+            if resp.status_code != 200:
+                logger.warning(f"getActivities returned HTTP {resp.status_code}")
+                break
+
+            try:
+                data = resp.json()
+            except Exception as e:
+                logger.warning(f"getActivities returned non-JSON: {e}")
+                break
+
+            batch = data.get("data", [])
+            if not batch:
+                break
+
+            if start == 0 and batch:
+                logger.debug(f"getActivities first-item keys: {list(batch[0].keys())}")
+
+            for item in batch:
+                records.append(_parse_activity_item(item))
+
+            start += len(batch)
+            if start >= data.get("recordsTotal", start):
+                break
+            draw += 1
+
+    return records
+
+
+async def scan_export_page(
+    context: BrowserContext,
+    cookies: dict,
+    logger: logging.Logger,
+) -> list[dict]:
+    """
+    Returns export job records: [{"job_id", "source_name", "status", "download_url"}, ...].
+
+    On the first call, loads the export page via Playwright solely to intercept the
+    getActivities XHR endpoint URL and headers.  Every subsequent call skips Playwright
+    entirely and calls that endpoint directly via httpx, avoiding the DataTable's
+    continuous auto-poll loop that was hammering the service.
+    """
+    global _activities_endpoint
+
+    if _activities_endpoint:
+        return await _fetch_activities_httpx(cookies, logger)
+
+    # ── First call: capture the endpoint from the browser, then switch to httpx ──
     export_page_url = f"{BASE_URL}/{CUSTOMER_ID}/o365/exchange/export"
     page = await context.new_page()
-    records: list[dict] = []
 
     try:
-        await page.goto(export_page_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_MS)
+        async with page.expect_response(
+            lambda r: "/getActivities" in r.url and r.status == 200,
+            timeout=ELEMENT_MS,
+        ) as resp_info:
+            await page.goto(export_page_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_MS)
 
-        try:
-            await page.wait_for_selector("#exportListItems tbody tr", timeout=ELEMENT_MS)
-        except PWTimeout:
-            logger.info("Export table empty — no export jobs exist yet.")
-            return []
+        activities_resp = await resp_info.value
+        req = activities_resp.request
+        _activities_endpoint = {
+            "url": req.url,
+            "headers": {
+                k: v for k, v in req.headers.items()
+                if k.lower() not in ("host", "content-length", "cookie")
+            },
+        }
+        logger.info(f"Captured getActivities endpoint: {_activities_endpoint['url']}")
 
-        while True:
-            # Extract every visible row via a single JS evaluation (faster than
-            # calling query_selector_all from Python for each cell).
-            batch = await page.evaluate("""() => {
-                const rows = document.querySelectorAll('#exportListItems tbody tr');
-                return Array.from(rows).map(tr => {
-                    const cells = tr.querySelectorAll('td');
-                    const source = cells[0] ? cells[0].innerText.trim() : '';
-                    const status = cells[7] ? cells[7].innerText.trim().toLowerCase() : '';
-                    let job_id = null, download_href = null;
-                    if (cells[8]) {
-                        for (const a of cells[8].querySelectorAll('a[href]')) {
-                            const href = a.getAttribute('href') || '';
-                            const m = href.match(/[?&]id=(\\d+)/);
-                            if (m) job_id = m[1];
-                            if (href.includes('/download')) download_href = href;
-                        }
-                    }
-                    return { source, status, job_id, download_href };
-                });
-            }""")
-
-            for row in batch:
-                href = row.pop("download_href") or ""
-                if href and not href.startswith("http"):
-                    href = BASE_URL + href
-                row["download_url"] = href
-                row["source_name"] = row.pop("source")
-                records.append(row)
-
-            # Advance to the next DataTable page if one exists
-            next_btn = await page.query_selector("#exportListItems_next:not(.disabled)")
-            if not next_btn:
-                break
-            await next_btn.click()
-            await page.wait_for_load_state("networkidle", timeout=15_000)
-
-    except PWTimeout as e:
-        logger.warning(f"Timeout while loading export page: {e}")
+    except PWTimeout:
+        logger.warning(
+            "getActivities XHR not observed within timeout — "
+            "export page may be empty or the endpoint URL has changed."
+        )
+    except Exception as e:
+        logger.warning(f"Error capturing getActivities endpoint: {e}")
     finally:
         await page.close()
 
-    return records
+    if _activities_endpoint:
+        return await _fetch_activities_httpx(cookies, logger)
+
+    logger.warning("Could not capture getActivities endpoint — returning empty list.")
+    return []
 
 
 async def discover_and_scan_exports(
@@ -702,7 +793,7 @@ async def discover_and_scan_exports(
     global _export_cache, _export_cache_time
 
     logger.info("Scanning export page for existing jobs...")
-    records = await scan_export_page(context, logger)
+    records = await scan_export_page(context, cookies, logger)
 
     for rec in records:
         if rec["job_id"]:
@@ -761,7 +852,7 @@ async def poll_for_download_url(
                         f"[{service_id}] Refreshing export status "
                         f"(cache age {cache_age:.0f}s)..."
                     )
-                    records = await scan_export_page(context, logger)
+                    records = await scan_export_page(context, cookies, logger)
                     for rec in records:
                         if rec["job_id"]:
                             _export_cache[rec["job_id"]] = rec
