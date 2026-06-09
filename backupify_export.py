@@ -630,36 +630,33 @@ _activities_endpoint: dict = {}  # {"url": str, "headers": dict}
 def _parse_activity_item(item: dict) -> dict:
     """
     Convert a single getActivities JSON row into the standard record dict.
-    Uses multiple field-name fallbacks to handle Backupify API variations.
+
+    Response structure (from live API):
+      item["run"]["id"]           — job ID (epoch ms, matches what trigger_export stores)
+      item["source"]              — display name
+      item["status"]              — "completed" | "in progress" | "failed"
+      item["export"]["extension"] — "pst" (present on completed exports)
+      item["export"]["state"]     — "Download" when ready to download
+
+    Download URL is not in the response — it must be constructed as:
+      /CUSTOMER_ID/download?type=export&appType=office365_exchange&id=RUN_ID&ext=EXT
     """
-    job_id = str(
-        item.get("id") or item.get("jobId") or item.get("job_id") or ""
-    ).strip() or None
+    run = item.get("run") or {}
+    job_id = str(run.get("id") or item.get("timestamp") or "").strip() or None
 
-    source_name = re.sub(r"<[^>]+>", "", str(
-        item.get("sourceName") or item.get("source_name") or
-        item.get("name") or item.get("source") or ""
-    )).strip()
+    source_name = re.sub(r"<[^>]+>", "", str(item.get("source") or "")).strip()
 
-    details = item.get("details") or {}
-    if isinstance(details, str):
-        try:
-            details = json.loads(details)
-        except Exception:
-            details = {}
+    status = str(item.get("status") or "").lower()
 
-    status = str(
-        item.get("status") or details.get("status") or
-        item.get("state") or details.get("state") or ""
-    ).lower()
-
-    download_url = str(
-        item.get("downloadUrl") or item.get("download_url") or
-        details.get("downloadUrl") or details.get("download_url") or
-        item.get("exportUrl") or ""
-    ).strip()
-    if download_url and not download_url.startswith("http"):
-        download_url = BASE_URL + download_url
+    # Build download URL only when the export is actually ready to download
+    export_info = item.get("export") or {}
+    download_url = ""
+    if status == "completed" and export_info.get("state") == "Download" and job_id:
+        ext = export_info.get("extension") or "pst"
+        download_url = (
+            f"{BASE_URL}/{CUSTOMER_ID}/download"
+            f"?type=export&appType=office365_exchange&id={job_id}&ext={ext}"
+        )
 
     return {
         "job_id":       job_id,
