@@ -890,6 +890,63 @@ async def poll_for_download_url(
 
 # ─── File download ────────────────────────────────────────────────────────────
 
+_PST_MAGIC = b"!BDN"
+
+
+def _infer_extension(resp_headers: dict) -> str:
+    """
+    Determine the correct file extension from HTTP response headers.
+    Falls back to .pst — Backupify exports raw PST files, not zips.
+    """
+    disp = resp_headers.get("content-disposition", "")
+    m = re.search(r'filename\*?=(?:utf-8\'\')?["\']?([^\s";\']+)', disp, re.IGNORECASE)
+    if m:
+        suffixes = "".join(Path(m.group(1).strip("\"'")).suffixes)
+        if suffixes:
+            return suffixes
+
+    ct = resp_headers.get("content-type", "").lower()
+    if "zip" in ct:
+        return ".zip"
+    if "octet-stream" not in ct and ct:
+        # Any named type that isn't a generic binary blob — trust it
+        ext = {"application/vnd.ms-outlook": ".pst"}.get(ct.split(";")[0].strip())
+        if ext:
+            return ext
+
+    return ".pst"
+
+
+def migrate_misnamed_downloads(output_dir: Path, state: StateManager, logger: logging.Logger) -> None:
+    """
+    Rename any .pst.zip files that are actually bare PST files (magic bytes !BDN).
+    Updates the state record so the filename stays accurate.
+    """
+    for zip_path in sorted(output_dir.glob("*.pst.zip")):
+        try:
+            with open(zip_path, "rb") as f:
+                magic = f.read(4)
+        except OSError:
+            continue
+
+        if magic != _PST_MAGIC:
+            continue  # it really is a zip (or something else) — leave it alone
+
+        pst_path = zip_path.with_suffix("")  # strips .zip → leaves .pst
+        if pst_path.exists():
+            logger.warning(f"Cannot rename {zip_path.name}: {pst_path.name} already exists.")
+            continue
+
+        zip_path.rename(pst_path)
+        logger.info(f"Renamed {zip_path.name} → {pst_path.name}")
+
+        for info in state.state["completed"].values():
+            if info.get("filename") == zip_path.name:
+                info["filename"] = pst_path.name
+
+    state.save()
+
+
 async def download_file(
     download_url: str,
     cookies: dict,
@@ -901,29 +958,30 @@ async def download_file(
     """
     Streams the export file to disk. Returns the filename on success, None on failure.
     Uses httpx for streaming — Playwright is not suitable for 100 GB files.
+    The file extension is determined from the server's response headers rather than
+    assumed, since Backupify serves raw PST files rather than zips.
     """
     if download_url.startswith("/"):
         download_url = BASE_URL + download_url
 
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
     safe_name     = re.sub(r'[<>:"/\\|?*\s]', "_", user_name).strip("_")
-    filename      = output_dir / f"{safe_name}__{service_id}.pst.zip"
-    part_file     = filename.with_suffix(".zip.part")
+    stem          = f"{safe_name}__{service_id}"
 
-    # If the final file already exists (e.g. state was lost but file is intact),
-    # skip the download — the caller's state.is_done() check should have caught
-    # this, but be safe.
-    if filename.exists():
-        size_mb = filename.stat().st_size / 1024 / 1024
-        logger.info(f"[{service_id}] Final file already exists ({size_mb:.1f} MB), skipping download.")
-        return filename.name
+    # Safety check: if a file with any expected extension already exists, skip.
+    for ext in (".pst", ".pst.zip", ".zip"):
+        existing = output_dir / f"{stem}{ext}"
+        if existing.exists():
+            size_mb = existing.stat().st_size / 1024 / 1024
+            logger.info(f"[{service_id}] File already exists ({existing.name}, {size_mb:.1f} MB), skipping.")
+            return existing.name
 
-    # Clean up any stale partial file from a previous interrupted download
+    # Use a generic part file while streaming; rename to the correct extension once
+    # the server's Content-Disposition / Content-Type headers are known.
+    part_file = output_dir / f"{stem}.part"
     if part_file.exists():
         logger.info(f"[{service_id}] Removing stale partial file {part_file.name}")
         part_file.unlink()
-
-    logger.info(f"[{service_id}] Downloading to {filename.name}")
 
     try:
         async with httpx.AsyncClient(
@@ -942,8 +1000,12 @@ async def download_file(
                     logger.error(f"[{service_id}] Download HTTP {resp.status_code}")
                     return None
 
-                total = int(resp.headers.get("content-length", 0))
-                desc  = f"{safe_name[:35]:<35}"
+                ext      = _infer_extension(dict(resp.headers))
+                filename = output_dir / f"{stem}{ext}"
+                total    = int(resp.headers.get("content-length", 0))
+                desc     = f"{safe_name[:35]:<35}"
+
+                logger.info(f"[{service_id}] Downloading to {filename.name}")
 
                 with tqdm(
                     total=total or None,
@@ -958,7 +1020,6 @@ async def download_file(
                             f.write(chunk)
                             bar.update(len(chunk))
 
-        # Atomically promote the temp file to its final name
         part_file.rename(filename)
         size_mb = filename.stat().st_size / 1024 / 1024
         logger.info(f"[{service_id}] Saved {filename.name} ({size_mb:.1f} MB)")
@@ -1070,6 +1131,9 @@ async def main(output_dir: Path, concurrency: int, resume: bool, dry_run: bool):
     logger.info(f"Resume mode  : {resume}")
     logger.info(f"Playwright debug log: playwright_debug.log")
     logger.info("=" * 60)
+
+    # ── 0. Migrate any previously-downloaded files that have the wrong extension ──
+    migrate_misnamed_downloads(output_dir, state, logger)
 
     # ── 1. Login ──
     context = await login(logger, debug_log)
