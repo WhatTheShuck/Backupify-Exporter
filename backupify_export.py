@@ -34,7 +34,12 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
-from playwright.async_api import async_playwright, BrowserContext, TimeoutError as PWTimeout
+from playwright.async_api import (
+    async_playwright,
+    BrowserContext,
+    Error as PWError,
+    TimeoutError as PWTimeout,
+)
 
 from rich.markup import escape as rich_escape
 
@@ -698,16 +703,28 @@ async def scan_export_page(context: BrowserContext, logger: logging.Logger) -> l
             if pages >= 40:
                 logger.warning("Export page scan stopped after 40 pages.")
                 break
-            next_btn = await page.query_selector("#exportListItems_next:not(.disabled)")
-            if not next_btn:
+            # The heartbeat XHR can redraw the table at any moment, detaching
+            # the button between locate and click — retry with a fresh locator,
+            # then settle for the rows scraped so far.
+            clicked = False
+            for _ in range(3):
+                try:
+                    next_btn = page.locator("#exportListItems_next:not(.disabled)")
+                    if not await next_btn.count():
+                        break
+                    await next_btn.first.click(timeout=5_000)
+                    clicked = True
+                    break
+                except PWError:
+                    await page.wait_for_timeout(1_000)
+            if not clicked:
                 break
-            await next_btn.click()
-            # The export page runs heartbeat XHRs, so "networkidle" never
-            # settles — give the AJAX redraw a fixed moment to land instead.
+            # "networkidle" never settles on this page — give the AJAX redraw
+            # a fixed moment to land instead.
             await page.wait_for_timeout(2_500)
 
-    except PWTimeout as e:
-        logger.warning(f"Timeout loading export page: {e}")
+    except PWError as e:
+        logger.warning(f"Export page scan aborted, keeping {len(records)} row(s): {e}")
     finally:
         await page.close()
 
@@ -730,17 +747,20 @@ async def poll_for_download_url(
     service_id: str,
     logger: logging.Logger,
     on_status=None,
+    max_unseen: int = 4,
 ) -> tuple[str, str | None]:
     """
     Waits until the export job is completed and returns (outcome, url):
       ("ok", url)       — job completed, download URL available
-      ("missing", None) — job never appeared on the export page (stale job id)
+      ("missing", None) — job absent from the export page for max_unseen scans
       ("failed", None)  — job ended in failed/error/cancelled
       ("timeout", None) — EXPORT_TIMEOUT exceeded
 
     All concurrent workers share one page-scan via _export_scan_lock.
     on_status: optional callable(str) for live UI updates each poll.
     """
+    global _export_cache_time
+
     start          = time.monotonic()
     deadline       = start + EXPORT_TIMEOUT
     unseen_scans   = 0
@@ -751,7 +771,13 @@ async def poll_for_download_url(
         if cache_age >= POLL_INTERVAL:
             async with _export_scan_lock:
                 if time.monotonic() - _export_cache_time >= POLL_INTERVAL:
-                    await refresh_export_cache(context, logger)
+                    try:
+                        await refresh_export_cache(context, logger)
+                    except Exception as e:
+                        # A flaky scan must not kill the worker — back off
+                        # until the next interval and try again.
+                        logger.warning(f"Export scan failed (will retry): {e}")
+                        _export_cache_time = time.monotonic()
 
         record  = _export_cache.get(str(job_id))
         elapsed = int(time.monotonic() - start)
@@ -775,8 +801,8 @@ async def poll_for_download_url(
                 unseen_scans  += 1
                 last_scan_time = _export_cache_time
             if on_status:
-                on_status(f"job {job_id}: not listed yet (scan {unseen_scans}/4)")
-            if unseen_scans >= 4:
+                on_status(f"job {job_id}: not listed yet (scan {unseen_scans}/{max_unseen})")
+            if unseen_scans >= max_unseen:
                 logger.warning(
                     f"[{service_id}] Job {job_id} absent after {unseen_scans} scans — treating as stale."
                 )
@@ -1411,9 +1437,13 @@ class BackupifyApp(App):
                     self.post_message(ExportUpdate(sid, "polling", text))
 
                 self.post_message(ExportUpdate(sid, "polling", f"job {job_id}"))
+                # A resumed job that's absent is stale (4 scans); a freshly
+                # triggered one definitely exists, so wait longer (10 scans)
+                # before giving up on it.
                 outcome, download_url = await poll_for_download_url(
                     self._pw_context, job_id, sid, self._bfy_logger,
                     on_status=_poll_status,
+                    max_unseen=4 if resumed else 10,
                 )
 
                 if outcome == "missing" and resumed:
@@ -1436,6 +1466,7 @@ class BackupifyApp(App):
                     outcome, download_url = await poll_for_download_url(
                         self._pw_context, job_id, sid, self._bfy_logger,
                         on_status=_poll_status,
+                        max_unseen=10,
                     )
 
                 if not download_url:
