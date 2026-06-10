@@ -3,113 +3,206 @@
 # dependencies = [
 #   "playwright>=1.44.0",
 #   "httpx>=0.27.0",
-#   "tqdm>=4.66.0",
+#   "textual>=0.52.0",
 # ]
 # ///
 """
-Backupify M365 PST Bulk Exporter
-=================================
-Automates exporting all Exchange mailbox PST files from Backupify.
+Backupify M365 Bulk Exporter
+============================
+TUI-driven tool for bulk-exporting Backupify/Datto M365 backups to local files.
+Supports Exchange PST; OneDrive, SharePoint, and Teams planned (see ROADMAP.md).
 
-Architecture:
-  - Playwright handles everything that touches the SPA (login, user discovery,
-    snapshot extraction, triggering exports, polling for completion)
-  - httpx handles streaming large file downloads (unsuitable for Playwright)
+Configuration lives at ~/.config/backupify_exporter/config.toml — an onboarding
+wizard creates it on first run, or power users can write it by hand.
 
-Usage:
-    uv run backupify_export.py --output /path/to/output/drive
-    uv run backupify_export.py --output /path/to/output/drive --resume
-    uv run backupify_export.py --output /path/to/output/drive --dry-run
-    uv run backupify_export.py --output /path/to/output/drive --concurrency 6
-
-First-time setup (once only — installs Chromium):
+First-time setup — install Chromium browser driver (once only):
     uv run python -m playwright install chromium
+
+Then just run:
+    uv run backupify_export.py
 """
 
-import argparse
 import asyncio
+import copy
 import json
 import logging
 import re
-import sys
 import time
+import tomllib
 from datetime import datetime
 from pathlib import Path
 
 import httpx
-from tqdm import tqdm
-from playwright.async_api import async_playwright, Page, BrowserContext, TimeoutError as PWTimeout
+from playwright.async_api import async_playwright, BrowserContext, TimeoutError as PWTimeout
 
-# ─── Configuration ────────────────────────────────────────────────────────────
+from textual import on, work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical
+from textual.message import Message
+from textual.screen import Screen
+from textual.widgets import (
+    Button,
+    ContentSwitcher,
+    DataTable,
+    Footer,
+    Header,
+    Input,
+    Label,
+    RichLog,
+    Select,
+    SelectionList,
+    Static,
+    TabbedContent,
+    TabPane,
+)
+from textual.widgets.selection_list import Selection
 
-BASE_URL        = "https://aue1-bfyii-2621-ext.backupify.com"
-CUSTOMER_ID     = "292424"
-EXT_CUSTOMER_ID = "24fd7c0d-2a29-11eb-ae0f-0cc47a57db64"
-LOGIN_URL       = "https://auth.datto.com/login?login_hint=brandon.wiedman@ksb.com.au"
-DASHBOARD_URL   = f"{BASE_URL}/{CUSTOMER_ID}/o365?external_customer_id={EXT_CUSTOMER_ID}"
-EXCHANGE_URL    = f"{BASE_URL}/{CUSTOMER_ID}/o365/exchange"
-EXPORT_ACTION   = f"{BASE_URL}/{CUSTOMER_ID}/restoreExportAction"
 
-# Saved session file — stored in the user's home dir so it persists across runs
-COOKIE_FILE     = Path.home() / ".backupify_session.json"
-USERS_FILE      = Path.home() / f".backupify_users_{CUSTOMER_ID}.json"
+# ─── Config file ──────────────────────────────────────────────────────────────
 
-# Seconds between polls when waiting for an export job to finish
-POLL_INTERVAL    = 30
-# Max seconds to wait for a single export job (3 hours)
-EXPORT_TIMEOUT   = 10_800
-# Max seconds allowed for a single file download (2 hours)
-DOWNLOAD_TIMEOUT = 7_200
-# Download chunk size
-CHUNK_SIZE       = 16 * 1024 * 1024  # 16 MB
+CONFIG_DIR  = Path.home() / ".config" / "backupify_exporter"
+CONFIG_FILE = CONFIG_DIR / "config.toml"
 
-# Playwright timeouts (milliseconds)
-PAGE_LOAD_MS     = 60_000   # 60 s for a page to load
-ELEMENT_MS       = 30_000   # 30 s to find an element
-LOGIN_MS         = 300_000  # 5 min for human to complete login + TOTP
+_DEFAULT_CONFIG: dict = {
+    "account": {
+        "email":        "",
+        "totp_enabled": True,
+    },
+    "server": {
+        "base_url":        "",
+        "customer_id":     "",
+        "ext_customer_id": "",
+    },
+    "defaults": {
+        "concurrency": 8,
+        "output_dir":  str(Path.home() / "backupify_exports"),
+    },
+}
+
+
+def load_config() -> dict:
+    cfg = copy.deepcopy(_DEFAULT_CONFIG)
+    if not CONFIG_FILE.exists():
+        return cfg
+    try:
+        with open(CONFIG_FILE, "rb") as fh:
+            data = tomllib.load(fh)
+        for section, values in data.items():
+            if section in cfg and isinstance(cfg[section], dict):
+                cfg[section].update(values)
+            else:
+                cfg[section] = values
+    except Exception:
+        pass
+    return cfg
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Backupify Exporter configuration",
+        "#",
+        "# To find your server details, open Backupify in a browser.",
+        "# The address bar will show something like:",
+        "#   https://<base_url>/<customer_id>/o365?external_customer_id=<ext_customer_id>",
+        "",
+    ]
+    for section, values in cfg.items():
+        lines.append(f"[{section}]")
+        for key, val in values.items():
+            if isinstance(val, bool):
+                lines.append(f"{key} = {'true' if val else 'false'}")
+            elif isinstance(val, int):
+                lines.append(f"{key} = {val}")
+            else:
+                escaped = str(val).replace("\\", "\\\\").replace('"', '\\"')
+                lines.append(f'{key} = "{escaped}"')
+        lines.append("")
+    CONFIG_FILE.write_text("\n".join(lines), encoding="utf-8")
+
+
+def config_is_complete(cfg: dict) -> bool:
+    s = cfg.get("server", {})
+    a = cfg.get("account", {})
+    return bool(s.get("base_url") and s.get("customer_id") and a.get("email"))
+
+
+# ─── Runtime globals (set by apply_config before any business logic runs) ─────
+
+BASE_URL        = ""
+CUSTOMER_ID     = ""
+EXT_CUSTOMER_ID = ""
+LOGIN_URL       = ""
+DASHBOARD_URL   = ""
+EXCHANGE_URL    = ""
+EXPORT_ACTION   = ""
+COOKIE_FILE: Path = Path.home() / ".backupify_session.json"
+USERS_FILE:  Path = Path.home() / ".backupify_users_.json"
+
+
+def apply_config(cfg: dict) -> None:
+    """Overwrite module-level runtime globals from the loaded config dict."""
+    global BASE_URL, CUSTOMER_ID, EXT_CUSTOMER_ID, LOGIN_URL
+    global DASHBOARD_URL, EXCHANGE_URL, EXPORT_ACTION, COOKIE_FILE, USERS_FILE
+
+    s = cfg["server"]
+    a = cfg["account"]
+
+    BASE_URL        = s.get("base_url", "").rstrip("/")
+    CUSTOMER_ID     = s.get("customer_id", "")
+    EXT_CUSTOMER_ID = s.get("ext_customer_id", "")
+    LOGIN_URL       = f"https://auth.datto.com/login?login_hint={a.get('email', '')}"
+    DASHBOARD_URL   = f"{BASE_URL}/{CUSTOMER_ID}/o365?external_customer_id={EXT_CUSTOMER_ID}"
+    EXCHANGE_URL    = f"{BASE_URL}/{CUSTOMER_ID}/o365/exchange"
+    EXPORT_ACTION   = f"{BASE_URL}/{CUSTOMER_ID}/restoreExportAction"
+    COOKIE_FILE     = Path.home() / ".backupify_session.json"
+    USERS_FILE      = Path.home() / f".backupify_users_{CUSTOMER_ID}.json"
+
+
+# ─── Poll / download tunables ─────────────────────────────────────────────────
+
+POLL_INTERVAL    = 30           # seconds between export-status scans
+EXPORT_TIMEOUT   = 10_800       # max wait for one export job (3 h)
+DOWNLOAD_TIMEOUT = 7_200        # max read time for one download (2 h)
+CHUNK_SIZE       = 16 * 1024 * 1024
+
+PAGE_LOAD_MS = 60_000
+ELEMENT_MS   = 30_000
+LOGIN_MS     = 300_000
 
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 def setup_logging(output_dir: Path) -> logging.Logger:
-    log_path = output_dir / f"backupify_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    fmt = "%(asctime)s [%(levelname)s] %(message)s"
-    logging.basicConfig(
-        level=logging.INFO,
-        format=fmt,
-        handlers=[
-            logging.FileHandler(log_path, encoding="utf-8"),
-            logging.StreamHandler(sys.stdout),
-        ],
-    )
-    return logging.getLogger("backupify")
+    """File-only logger — stdout belongs to the TUI."""
+    log_path = output_dir / f"backupify_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    logger = logging.getLogger("backupify")
+    logger.setLevel(logging.INFO)
+    if not logger.handlers:
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        logger.addHandler(fh)
+    return logger
 
 
 def setup_playwright_debug_logging() -> logging.Logger:
-    """
-    Creates a dedicated logger that writes all Playwright page events
-    (console, requests, responses, navigation, JS errors) to playwright_debug.log
-    in the current working directory.  Does NOT propagate to the root logger.
-    """
     debug_log = logging.getLogger("pw_debug")
     debug_log.setLevel(logging.DEBUG)
     debug_log.propagate = False
-
-    handler = logging.FileHandler("playwright_debug.log", encoding="utf-8", mode="w")
-    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
-    debug_log.addHandler(handler)
+    if not debug_log.handlers:
+        handler = logging.FileHandler("playwright_debug.log", encoding="utf-8", mode="w")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s", datefmt="%H:%M:%S"))
+        debug_log.addHandler(handler)
     return debug_log
 
 
 def attach_page_listeners(page, debug_log: logging.Logger) -> None:
-    """Attaches debug event listeners to a single Playwright Page."""
-
     page.on("console", lambda msg: debug_log.debug(
         f"[CONSOLE:{msg.type.upper():7}] {msg.text}"
     ))
-    page.on("pageerror", lambda exc: debug_log.debug(
-        f"[JSERROR ] {exc}"
-    ))
+    page.on("pageerror", lambda exc: debug_log.debug(f"[JSERROR ] {exc}"))
+
     def _log_request(req):
         line = f"[REQUEST ] {req.method:<6} {req.url}"
         if req.method == "POST" and req.post_data and BASE_URL in req.url:
@@ -129,6 +222,7 @@ def attach_page_listeners(page, debug_log: logging.Logger) -> None:
 
 class StateManager:
     def __init__(self, output_dir: Path):
+        output_dir.mkdir(parents=True, exist_ok=True)
         self.path  = output_dir / "progress.json"
         self.state = self._load()
 
@@ -137,7 +231,6 @@ class StateManager:
             try:
                 with open(self.path) as f:
                     data = json.load(f)
-                    # Back-fill missing bucket for files written by older versions
                     data.setdefault("in_progress", {})
                     return data
             except Exception:
@@ -185,13 +278,6 @@ class StateManager:
         self.state["in_progress"].pop(service_id, None)
         self.save()
 
-    def summary(self) -> dict:
-        return {
-            "completed":   len(self.state["completed"]),
-            "in_progress": len(self.state["in_progress"]),
-            "failed":      len(self.state["failed"]),
-        }
-
 
 # ─── Authentication ───────────────────────────────────────────────────────────
 
@@ -200,26 +286,19 @@ async def _save_cookies(context: BrowserContext) -> None:
     COOKIE_FILE.write_text(json.dumps(cookies, indent=2), encoding="utf-8")
 
 
-async def _try_restore_session(
-    context: BrowserContext,
-    logger: logging.Logger,
-) -> bool:
+async def _try_restore_session(context: BrowserContext, logger: logging.Logger) -> bool:
     """
-    Loads cookies from COOKIE_FILE into the browser context, then navigates to
-    the dashboard to verify the session is still valid.  Returns True if we're
-    logged in, False if the cookies are missing or expired.
+    Loads cookies from COOKIE_FILE into the browser context, navigates to
+    the dashboard, and returns True if the session is still valid.
     """
     if not COOKIE_FILE.exists():
         return False
-
     try:
         cookies = json.loads(COOKIE_FILE.read_text(encoding="utf-8"))
     except Exception:
         return False
-
     if not cookies:
         return False
-
     try:
         await context.add_cookies(cookies)
     except Exception as e:
@@ -230,23 +309,18 @@ async def _try_restore_session(
     page = await context.new_page()
     try:
         await page.goto(DASHBOARD_URL, wait_until="domcontentloaded", timeout=30_000)
-        # If we were redirected back to the auth domain the session has expired
         if BASE_URL not in page.url:
             logger.info(f"Session expired (redirected to {page.url[:60]}...).")
             return False
-
-        # Confirm the dashboard is actually rendered
-        dashboard_selectors = ["nav", "[class*='nav']", "[class*='sidebar']",
-                               "a[href*='/o365']", ".app-container", "#app"]
-        for sel in dashboard_selectors:
+        for sel in ["nav", "[class*='nav']", "[class*='sidebar']",
+                    "a[href*='/o365']", ".app-container", "#app"]:
             try:
                 await page.wait_for_selector(sel, timeout=5_000)
                 logger.info("Saved session is valid — skipping interactive login.")
                 return True
             except PWTimeout:
                 continue
-
-        logger.info("Dashboard element not found after session restore — treating as expired.")
+        logger.info("Dashboard element not found after session restore.")
         return False
     except PWTimeout:
         logger.warning("Timed out while validating saved session.")
@@ -255,92 +329,99 @@ async def _try_restore_session(
         await page.close()
 
 
-def _make_context_listener(debug_log):
+def _make_listener(debug_log):
     return lambda p: attach_page_listeners(p, debug_log)
 
 
-async def login(logger: logging.Logger, debug_log: logging.Logger) -> BrowserContext:
+async def login(
+    logger: logging.Logger,
+    debug_log: logging.Logger,
+    on_status=None,
+) -> BrowserContext:
     """
-    Returns an authenticated BrowserContext.
+    Returns an authenticated BrowserContext.  Tries a saved session first
+    (fully headless).  Falls back to a visible browser for interactive login,
+    then saves the cookies so the next run is headless.
 
-    If a valid saved session exists the browser runs headless — no window at
-    all.  Only when a fresh login is needed does a visible window open; once
-    the user completes login the cookies are saved so the next run is headless.
+    on_status: optional callable(str) — phase updates for a UI to display.
     """
+    def _status(text: str) -> None:
+        if on_status:
+            on_status(text)
+
+    _status("Starting browser engine…")
     pw = await async_playwright().start()
-    _quiet_args = ["--no-first-run", "--no-default-browser-check", "--disable-extensions"]
+    _args = ["--no-first-run", "--no-default-browser-check", "--disable-extensions"]
 
-    # ── Try headless restore first ──
     if COOKIE_FILE.exists():
-        browser = await pw.chromium.launch(headless=True, args=_quiet_args)
+        _status("Validating saved session…")
+        browser = await pw.chromium.launch(headless=True, args=_args)
         context = await browser.new_context()
-        context.on("page", _make_context_listener(debug_log))
+        context.on("page", _make_listener(debug_log))
         if await _try_restore_session(context, logger):
             return context
         logger.info("Saved session invalid — falling back to interactive login.")
         await browser.close()
 
-    # ── Interactive login — visible browser required ──
-    logger.info("Opening browser — please enter your password and TOTP code when prompted.")
-    browser = await pw.chromium.launch(headless=False, slow_mo=50, args=_quiet_args)
+    _status("Browser window opened — complete login there (password + TOTP)")
+    logger.info("Opening browser for interactive login (password + TOTP if enabled).")
+    browser = await pw.chromium.launch(headless=False, slow_mo=50, args=_args)
     context = await browser.new_context()
-    context.on("page", _make_context_listener(debug_log))
+    context.on("page", _make_listener(debug_log))
 
     page = await context.new_page()
-
     page.on("framenavigated", lambda frame: (
-        logger.info(f"  → navigated to: {frame.url}") if frame == page.main_frame else None
+        logger.info(f"  → {frame.url}") if frame == page.main_frame else None
     ))
 
     await page.goto(LOGIN_URL, wait_until="domcontentloaded")
-    logger.info("Waiting for you to complete password + TOTP (5 minute limit)...")
 
     deadline = time.monotonic() + (LOGIN_MS / 1000)
     while time.monotonic() < deadline:
         await asyncio.sleep(1)
-        current_url = page.url
-
-        if BASE_URL not in current_url:
+        if BASE_URL not in page.url:
             continue
-
-        logger.info(f"On backupify domain. Current URL: {current_url}")
-
-        dashboard_selectors = [
-            "nav", "[class*='nav']", "[class*='sidebar']", "[class*='dashboard']",
-            "[class*='header']", "a[href*='/o365']", "a[href*='exchange']",
-            ".app-container", "#app",
-        ]
-        for sel in dashboard_selectors:
+        for sel in ["nav", "[class*='nav']", "[class*='sidebar']", "[class*='dashboard']",
+                    "[class*='header']", "a[href*='/o365']", ".app-container", "#app"]:
             try:
                 await page.wait_for_selector(sel, timeout=5_000)
-                logger.info(f"Dashboard element found ({sel}). Login complete.")
+                logger.info("Login complete.")
                 await _save_cookies(context)
-                logger.info(f"Session cookies saved to {COOKIE_FILE}")
+                logger.info(f"Session saved to {COOKIE_FILE}")
                 return context
             except PWTimeout:
                 continue
-
-        logger.info("On backupify domain but dashboard not rendered yet, waiting...")
         await asyncio.sleep(2)
 
     await browser.close()
-    raise RuntimeError(
-        "Login timed out after 5 minutes.\n"
-        f"Last URL was: {page.url}\n"
-        "If you completed login successfully, the dashboard selector may need updating."
-    )
+    raise RuntimeError(f"Login timed out after 5 minutes. Last URL: {page.url}")
+
+
+async def extract_cookies(context: BrowserContext) -> dict:
+    all_cookies = await context.cookies()
+    wanted      = {"__backupify_session", "PHPSESSID"}
+    cookies     = {c["name"]: c["value"] for c in all_cookies if c["name"] in wanted}
+    missing     = wanted - set(cookies.keys())
+    if missing:
+        found = [c["name"] for c in all_cookies]
+        raise RuntimeError(
+            f"Missing session cookies: {missing}\nCookies present: {found}"
+        )
+    return cookies
 
 
 # ─── User discovery ───────────────────────────────────────────────────────────
 
-async def get_all_users(context: BrowserContext, cookies: dict, logger: logging.Logger) -> list[dict]:
+async def get_all_users(
+    context: BrowserContext,
+    cookies: dict,
+    logger: logging.Logger,
+) -> list[dict]:
     """
-    Returns the full list of Exchange users.  On the first run, discovers them
-    by intercepting the /customerServices XHR and paginates via httpx, then
-    caches the result to USERS_FILE.  Subsequent runs load from cache
-    (delete the file to force a re-fetch).
+    Returns the full Exchange user list.  Loads from USERS_FILE cache on
+    subsequent runs; delete the file (or press F5 in the TUI) to re-fetch.
 
-    Returns [{"name", "email", "service_id", "snapshot_id"}, ...].
+    Returns [{"service_id", "name", "email", "snapshot_id"}, ...].
     """
     if USERS_FILE.exists():
         try:
@@ -350,11 +431,10 @@ async def get_all_users(context: BrowserContext, cookies: dict, logger: logging.
                 return users
         except Exception as e:
             logger.warning(f"Could not read user cache: {e} — re-fetching.")
-    logger.info("Loading Exchange recovery page to discover users...")
+
+    logger.info("Loading Exchange user list via customerServices XHR...")
     page = await context.new_page()
 
-    # Capture the exact POST body/headers the browser sends to customerServices
-    # so we can replay the request via httpx with a larger 'length'.
     captured_req: dict = {}
 
     def _capture_request(req):
@@ -368,7 +448,6 @@ async def get_all_users(context: BrowserContext, cookies: dict, logger: logging.
 
     page.on("request", _capture_request)
 
-    # Intercept the first response (gives us recordsTotal and one page of data)
     first_data: dict = {}
     try:
         async with page.expect_response(
@@ -377,96 +456,59 @@ async def get_all_users(context: BrowserContext, cookies: dict, logger: logging.
         ) as resp_info:
             await page.goto(EXCHANGE_URL, wait_until="domcontentloaded")
 
-        first_data = await (await resp_info.value).json()
+        first_data    = await (await resp_info.value).json()
         records_total = first_data.get("recordsTotal", 0)
-        first_batch   = first_data.get("data", [])
         logger.info(
-            f"customerServices page-1: {len(first_batch)} rows returned, "
+            f"customerServices page-1: {len(first_data.get('data', []))} rows, "
             f"{records_total} total."
         )
-
     except PWTimeout:
-        logger.error("customerServices XHR not seen within 45 s.")
         await page.close()
-        raise RuntimeError("customerServices XHR timed out — cannot discover users.")
+        raise RuntimeError("customerServices XHR not seen within 45 s.")
 
     await page.close()
 
-    # ── Fetch all records via httpx if the first page is incomplete ──────────
-    all_rows: list[dict] = first_data.get("data", [])
-
+    all_rows: list[dict] = list(first_data.get("data", []))
     records_total = first_data.get("recordsTotal", len(all_rows))
+
     if records_total > len(all_rows) and captured_req:
-        logger.info(f"Fetching all {records_total} records via httpx...")
-
-        # Build headers from the captured request but override the Cookie header
-        # with the session cookies extracted from the Playwright context — the
-        # browser's internal cookie header isn't always forwarded correctly.
-        headers = {
-            k: v for k, v in captured_req["headers"].items()
-            if k.lower() != "cookie"
-        }
+        logger.info(f"Paginating to fetch all {records_total} records...")
+        headers = {k: v for k, v in captured_req["headers"].items() if k.lower() != "cookie"}
         headers["cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
-
-        # Page through records with the server's own page size (changing only
-        # 'start' and 'draw'), because requesting length=recordsTotal returns 500.
-        page_size = len(first_data.get("data", [])) or 20
-        draw_num  = 2
-        offset    = len(all_rows)
+        draw_num = 2
+        offset   = len(all_rows)
 
         async with httpx.AsyncClient(follow_redirects=False, timeout=60.0) as client:
             while offset < records_total:
-                paged_body = captured_req["post_data"]
-                paged_body = re.sub(r'\bstart=\d+', f'start={offset}',   paged_body)
-                paged_body = re.sub(r'\bdraw=\d+',  f'draw={draw_num}',  paged_body)
-                draw_num  += 1
-
+                body = captured_req["post_data"]
+                body = re.sub(r"\bstart=\d+", f"start={offset}", body)
+                body = re.sub(r"\bdraw=\d+",  f"draw={draw_num}",  body)
+                draw_num += 1
                 resp = await client.post(
-                    captured_req["url"],
-                    content=paged_body.encode(),
-                    headers=headers,
+                    captured_req["url"], content=body.encode(), headers=headers
                 )
-
                 if resp.status_code != 200:
-                    logger.warning(
-                        f"Pagination page at start={offset} returned HTTP {resp.status_code}; "
-                        "stopping early."
-                    )
+                    logger.warning(f"Pagination at start={offset} returned {resp.status_code}.")
                     break
-
                 batch = resp.json().get("data", [])
                 if not batch:
                     break
                 all_rows.extend(batch)
                 offset += len(batch)
-                logger.info(f"  Fetched {offset}/{records_total} users...")
-    elif records_total > len(all_rows):
-        logger.warning(
-            "Could not capture customerServices request body — "
-            f"only the first {len(all_rows)} of {records_total} users will be processed."
-        )
-
-    # ── Parse rows into user dicts ───────────────────────────────────────────
-    if all_rows:
-        logger.info(f"First row keys: {list(all_rows[0].keys())}")
+                logger.info(f"  {offset}/{records_total} users fetched...")
 
     users: list[dict] = []
     for row in all_rows:
         service_id = str(row.get("id") or "")
         if not service_id:
             continue
-
         name  = re.sub(r"<[^>]+>", "", str(row.get("name")  or "")).strip()
         email = re.sub(r"<[^>]+>", "", str(row.get("email") or "")).strip()
-
-        # Pull the latest snapshot ID from the perfectBackups list.
-        # Each entry is {"snapshotId": <epoch_ms>}; we want the highest value.
         backups     = row.get("perfectBackups") or []
         snapshot_id = (
             str(max(backups, key=lambda b: b.get("snapshotId", 0))["snapshotId"])
             if backups else None
         )
-
         users.append({
             "service_id":  service_id,
             "name":        name or service_id,
@@ -475,13 +517,9 @@ async def get_all_users(context: BrowserContext, cookies: dict, logger: logging.
         })
 
     if not users:
-        raise RuntimeError(
-            "No users could be extracted from the customerServices response. "
-            "Check the log for the 'First row keys' entry and update field-name mapping."
-        )
+        raise RuntimeError("No users extracted from customerServices response.")
 
-    with_snap = sum(1 for u in users if u["snapshot_id"])
-    logger.info(f"Found {len(users)} Exchange users ({with_snap} with snapshot IDs).")
+    logger.info(f"Found {len(users)} Exchange users.")
     USERS_FILE.write_text(json.dumps(users, indent=2), encoding="utf-8")
     logger.info(f"User list cached to {USERS_FILE}.")
     return users
@@ -494,21 +532,13 @@ async def get_latest_snapshot_id(
     service_id: str,
     logger: logging.Logger,
 ) -> str | None:
-    """
-    Navigates to the user's service page and reads the latest snapshot ID
-    from the rendered DOM.
-    """
     service_url = f"{BASE_URL}/{CUSTOMER_ID}/o365/exchange/service?serviceId={service_id}"
     page = await context.new_page()
-
     try:
         await page.goto(service_url, wait_until="domcontentloaded")
         await page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_MS)
 
-        # Strategy 1: intercept the XHR that returns snapshot data
-        # We do this by reading window.__INITIAL_STATE__ or similar embedded JSON
         snapshot_id = await page.evaluate("""() => {
-            // Try common SPA state patterns
             if (window.__INITIAL_STATE__) {
                 const s = JSON.stringify(window.__INITIAL_STATE__);
                 const m = s.match(/"snapshotId"\\s*:\\s*"?(\\d+)"?/);
@@ -519,10 +549,8 @@ async def get_latest_snapshot_id(
                 const m = s.match(/"snapshotId"\\s*:\\s*"?(\\d+)"?/);
                 if (m) return m[1];
             }
-            // Try data attributes on the page
             const el = document.querySelector('[data-snapshot-id]');
             if (el) return el.getAttribute('data-snapshot-id');
-            // Try snapshot selector element
             const snap = document.querySelector('.snapshot-selector, #snapshot-selector, [class*="snapshot"]');
             if (snap) {
                 const attr = snap.getAttribute('data-value') || snap.getAttribute('data-id') || snap.value;
@@ -534,24 +562,19 @@ async def get_latest_snapshot_id(
         if snapshot_id:
             return str(snapshot_id)
 
-        # Strategy 2: look for snapshot ID in the rendered HTML source
         html = await page.content()
-
-        patterns = [
+        for pat in [
             r'"snapshotId"\s*:\s*"?(\d{10,})"?',
             r'data-snapshot-id=["\'](\d+)["\']',
             r'snapshot_id["\']?\s*[=:]\s*["\']?(\d{10,})',
-            r'value=["\'](\d{13})["\']',  # 13-digit epoch ms in a select/input
-        ]
-        for pat in patterns:
+            r'value=["\'](\d{13})["\']',
+        ]:
             m = re.search(pat, html)
             if m:
                 return m.group(1)
 
-        logger.warning(f"[{service_id}] Could not find snapshot ID — saving debug HTML.")
-        Path(f"debug_service_{service_id}.html").write_text(html, encoding="utf-8")
+        logger.warning(f"[{service_id}] Could not find snapshot ID.")
         return None
-
     except PWTimeout as e:
         logger.error(f"[{service_id}] Timeout loading service page: {e}")
         return None
@@ -568,11 +591,6 @@ async def trigger_export(
     snapshot_id: str,
     logger: logging.Logger,
 ) -> str | None:
-    """
-    POSTs to /restoreExportAction using the session cookies.
-    We use httpx here since it's a simple JSON POST — no SPA rendering needed.
-    Returns the job ID string, or None on failure.
-    """
     payload = {
         "actionType":         "export",
         "appType":            "office365_exchange",
@@ -583,27 +601,22 @@ async def trigger_export(
         "includeAttachments": "false",
         "services[]":         service_id,
     }
-
-    # Build cookie header from Playwright context cookies
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-
     async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
         resp = await client.post(
             EXPORT_ACTION,
             data=payload,
             headers={
-                "Cookie":       cookie_header,
-                "Referer":      f"{BASE_URL}/{CUSTOMER_ID}/o365/exchange/service?serviceId={service_id}",
-                "User-Agent":   "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+                "Cookie":           cookie_header,
+                "Referer":          f"{BASE_URL}/{CUSTOMER_ID}/o365/exchange/service?serviceId={service_id}",
+                "User-Agent":       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
                 "X-Requested-With": "XMLHttpRequest",
-                "Accept":       "application/json, text/javascript, */*",
+                "Accept":           "application/json, text/javascript, */*",
             },
         )
-
     if resp.status_code != 200:
         logger.error(f"[{service_id}] Export POST returned HTTP {resp.status_code}: {resp.text[:300]}")
         return None
-
     try:
         data   = resp.json()
         job_id = str(data["responseData"]["id"])
@@ -616,246 +629,102 @@ async def trigger_export(
 
 # ─── Export polling ───────────────────────────────────────────────────────────
 
-# Shared cache of export job statuses, refreshed by scanning the export page.
-# Maps job_id (str) -> {"job_id", "source_name", "status", "download_url"}.
-_export_cache: dict = {}
+_export_cache:      dict  = {}
 _export_cache_time: float = 0.0
-_export_scan_lock: asyncio.Lock | None = None  # initialised in main()
-
-# Captured getActivities XHR endpoint — populated on the first export-page load.
-# Once set, all subsequent polls bypass Playwright and call it directly via httpx.
-_activities_endpoint: dict = {}  # {"url": str, "headers": dict}
+_export_scan_lock: asyncio.Lock | None = None
 
 
-def _parse_activity_item(item: dict) -> dict:
+async def scan_export_page(context: BrowserContext, logger: logging.Logger) -> list[dict]:
     """
-    Convert a single getActivities JSON row into the standard record dict.
+    Navigates to the export page and parses all server-rendered DataTable rows,
+    paginating as needed.
 
-    Response structure (from live API):
-      item["run"]["id"]           — job ID (epoch ms, matches what trigger_export stores)
-      item["source"]              — display name
-      item["status"]              — "completed" | "in progress" | "failed"
-      item["export"]["extension"] — "pst" (present on completed exports)
-      item["export"]["state"]     — "Download" when ready to download
-
-    Download URL is not in the response — it must be constructed as:
-      /CUSTOMER_ID/download?type=export&appType=office365_exchange&id=RUN_ID&ext=EXT
+    Each record: {"job_id", "source_name", "status", "download_url"}.
     """
-    run = item.get("run") or {}
-    job_id = str(run.get("id") or item.get("timestamp") or "").strip() or None
-
-    source_name = re.sub(r"<[^>]+>", "", str(item.get("source") or "")).strip()
-
-    status = str(item.get("status") or "").lower()
-
-    # Build download URL only when the export is actually ready to download
-    export_info = item.get("export") or {}
-    download_url = ""
-    if status == "completed" and export_info.get("state") == "Download" and job_id:
-        ext = export_info.get("extension") or "pst"
-        download_url = (
-            f"{BASE_URL}/{CUSTOMER_ID}/download"
-            f"?type=export&appType=office365_exchange&id={job_id}&ext={ext}"
-        )
-
-    return {
-        "job_id":       job_id,
-        "source_name":  source_name,
-        "status":       status,
-        "download_url": download_url,
-    }
-
-
-async def _fetch_activities_httpx(cookies: dict, logger: logging.Logger) -> list[dict]:
-    """
-    Fetches all export activity rows directly from the getActivities endpoint
-    via httpx, paginating until all records are retrieved.
-    """
-    url = _activities_endpoint["url"]
-    headers = dict(_activities_endpoint["headers"])
-    headers["cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
-
+    export_page_url = f"{BASE_URL}/{CUSTOMER_ID}/o365/exchange/export"
+    page = await context.new_page()
     records: list[dict] = []
-    start = 0
-    page_size = 100  # larger than the browser uses to reduce round trips
-    draw = 1
 
-    async with httpx.AsyncClient(follow_redirects=False, timeout=60.0) as client:
+    try:
+        await page.goto(export_page_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_MS)
+        try:
+            await page.wait_for_selector("#exportListItems tbody tr", timeout=ELEMENT_MS)
+        except PWTimeout:
+            logger.info("Export table empty — no export jobs yet.")
+            return []
+
         while True:
-            body = (
-                f"start={start}&length={page_size}&draw={draw}"
-                f"&shouldIncludeDetails=true&appType=office365_exchange&activityType=export"
-            )
-            try:
-                resp = await client.post(url, content=body.encode(), headers=headers)
-            except httpx.RequestError as e:
-                logger.warning(f"getActivities request failed: {e}")
+            batch = await page.evaluate("""() => {
+                const rows = document.querySelectorAll('#exportListItems tbody tr');
+                return Array.from(rows).map(tr => {
+                    const cells = tr.querySelectorAll('td');
+                    const source = cells[0] ? cells[0].innerText.trim() : '';
+                    const status = cells[7] ? cells[7].innerText.trim().toLowerCase() : '';
+                    let job_id = null, download_href = null;
+                    if (cells[8]) {
+                        for (const a of cells[8].querySelectorAll('a[href]')) {
+                            const href = a.getAttribute('href') || '';
+                            const m = href.match(/[?&]id=(\\d+)/);
+                            if (m) job_id = m[1];
+                            if (href.includes('/download')) download_href = href;
+                        }
+                    }
+                    return { source, status, job_id, download_href };
+                });
+            }""")
+
+            for row in batch:
+                href = row.pop("download_href") or ""
+                if href and not href.startswith("http"):
+                    href = BASE_URL + href
+                row["download_url"] = href
+                row["source_name"]  = row.pop("source")
+                records.append(row)
+
+            next_btn = await page.query_selector("#exportListItems_next:not(.disabled)")
+            if not next_btn:
                 break
+            await next_btn.click()
+            await page.wait_for_load_state("networkidle", timeout=15_000)
 
-            if resp.status_code != 200:
-                logger.warning(f"getActivities returned HTTP {resp.status_code}")
-                break
-
-            try:
-                data = resp.json()
-            except Exception as e:
-                logger.warning(f"getActivities returned non-JSON: {e}")
-                break
-
-            batch = data.get("data", [])
-            if not batch:
-                break
-
-            if start == 0 and batch:
-                logger.debug(f"getActivities first-item keys: {list(batch[0].keys())}")
-
-            for item in batch:
-                records.append(_parse_activity_item(item))
-
-            start += len(batch)
-            if start >= data.get("recordsTotal", start):
-                break
-            draw += 1
+    except PWTimeout as e:
+        logger.warning(f"Timeout loading export page: {e}")
+    finally:
+        await page.close()
 
     return records
 
 
-async def scan_export_page(
-    context: BrowserContext,
-    cookies: dict,
-    logger: logging.Logger,
-) -> list[dict]:
-    """
-    Returns export job records: [{"job_id", "source_name", "status", "download_url"}, ...].
-
-    On the first call, loads the export page via Playwright solely to intercept the
-    getActivities XHR endpoint URL and headers.  Every subsequent call skips Playwright
-    entirely and calls that endpoint directly via httpx, avoiding the DataTable's
-    continuous auto-poll loop that was hammering the service.
-    """
-    global _activities_endpoint
-
-    if _activities_endpoint:
-        return await _fetch_activities_httpx(cookies, logger)
-
-    # ── First call: capture the endpoint from the browser, then switch to httpx ──
-    export_page_url = f"{BASE_URL}/{CUSTOMER_ID}/o365/exchange/export"
-    page = await context.new_page()
-
-    try:
-        async with page.expect_response(
-            lambda r: "/getActivities" in r.url and r.status == 200,
-            timeout=ELEMENT_MS,
-        ) as resp_info:
-            await page.goto(export_page_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_MS)
-
-        activities_resp = await resp_info.value
-        req = activities_resp.request
-        _activities_endpoint = {
-            "url": req.url,
-            "headers": {
-                k: v for k, v in req.headers.items()
-                if k.lower() not in ("host", "content-length", "cookie")
-            },
-        }
-        logger.info(f"Captured getActivities endpoint: {_activities_endpoint['url']}")
-
-    except PWTimeout:
-        logger.warning(
-            "getActivities XHR not observed within timeout — "
-            "export page may be empty or the endpoint URL has changed."
-        )
-    except Exception as e:
-        logger.warning(f"Error capturing getActivities endpoint: {e}")
-    finally:
-        await page.close()
-
-    if _activities_endpoint:
-        return await _fetch_activities_httpx(cookies, logger)
-
-    logger.warning("Could not capture getActivities endpoint — returning empty list.")
-    return []
-
-
-async def discover_and_scan_exports(
-    context: BrowserContext,
-    cookies: dict,
-    state: StateManager,
-    logger: logging.Logger,
-) -> None:
-    """
-    Scans the export page once at startup to populate the shared export cache
-    and report the current status of any jobs already tracked in StateManager.
-    """
+async def refresh_export_cache(context: BrowserContext, logger: logging.Logger) -> None:
+    """Scans the export page once and updates the shared status cache."""
     global _export_cache, _export_cache_time
-
-    logger.info("Scanning export page for existing jobs...")
-    records = await scan_export_page(context, cookies, logger)
-
+    records = await scan_export_page(context, logger)
     for rec in records:
         if rec["job_id"]:
             _export_cache[rec["job_id"]] = rec
     _export_cache_time = time.monotonic()
 
-    if not records:
-        logger.info("No existing export jobs found on the export page.")
-        return
-
-    # Report status for jobs we are already tracking
-    job_to_service = {
-        info["job_id"]: sid
-        for sid, info in state.state["in_progress"].items()
-        if info.get("job_id")
-    }
-    for rec in records:
-        jid = rec["job_id"]
-        if jid and jid in job_to_service:
-            sid = job_to_service[jid]
-            logger.info(
-                f"  Job {jid} ({rec['source_name']}): {rec['status']}"
-                + (f"  download_url={rec['download_url'][:80]}" if rec["download_url"] else "")
-            )
-
-    logger.info(f"Export page scan complete: {len(records)} record(s) found.")
-
 
 async def poll_for_download_url(
     context: BrowserContext,
-    cookies: dict,
     job_id: str,
     service_id: str,
     logger: logging.Logger,
 ) -> str | None:
     """
-    Waits until the export job reaches "completed" status, then returns the
-    download URL.  Uses a shared Playwright-based cache so that many concurrent
-    workers share a single export-page scan rather than each loading the page
-    independently.
+    Waits until the export job is completed and returns its download URL.
+    All concurrent workers share one page-scan via _export_scan_lock.
     """
-    global _export_cache, _export_cache_time, _export_scan_lock
-
     deadline = time.monotonic() + EXPORT_TIMEOUT
     attempt  = 0
 
     while time.monotonic() < deadline:
-        # ── Refresh the cache if it's older than POLL_INTERVAL ──
         cache_age = time.monotonic() - _export_cache_time
         if cache_age >= POLL_INTERVAL:
             async with _export_scan_lock:
-                # Re-check after acquiring the lock — another worker may have
-                # already refreshed while we were waiting.
                 if time.monotonic() - _export_cache_time >= POLL_INTERVAL:
-                    logger.info(
-                        f"[{service_id}] Refreshing export status "
-                        f"(cache age {cache_age:.0f}s)..."
-                    )
-                    records = await scan_export_page(context, cookies, logger)
-                    for rec in records:
-                        if rec["job_id"]:
-                            _export_cache[rec["job_id"]] = rec
-                    _export_cache_time = time.monotonic()
+                    await refresh_export_cache(context, logger)
 
-        # ── Check this job's status in the cache ──
         record = _export_cache.get(str(job_id))
         if record:
             status = record["status"]
@@ -864,20 +733,15 @@ async def poll_for_download_url(
                 if url:
                     logger.info(f"[{service_id}] Export ready after {attempt} poll(s).")
                     return url
-                # Completed but no download URL yet — treat as still pending
             elif status in ("failed", "error", "cancelled"):
-                logger.error(
-                    f"[{service_id}] Export job {job_id} ended with status: {status}"
-                )
+                logger.error(f"[{service_id}] Export job {job_id} ended: {status}")
                 return None
 
         attempt += 1
         if attempt % 4 == 0:
             elapsed = int(time.monotonic() - (deadline - EXPORT_TIMEOUT))
-            logger.info(
-                f"[{service_id}] Still waiting... {elapsed}s elapsed "
-                f"(job {job_id}, last status: {record['status'] if record else 'not seen'})"
-            )
+            last    = record["status"] if record else "not seen"
+            logger.info(f"[{service_id}] Still waiting {elapsed}s (job {job_id}, last: {last})")
 
         await asyncio.sleep(POLL_INTERVAL)
 
@@ -887,63 +751,6 @@ async def poll_for_download_url(
 
 # ─── File download ────────────────────────────────────────────────────────────
 
-_PST_MAGIC = b"!BDN"
-
-
-def _infer_extension(resp_headers: dict) -> str:
-    """
-    Determine the correct file extension from HTTP response headers.
-    Falls back to .pst — Backupify exports raw PST files, not zips.
-    """
-    disp = resp_headers.get("content-disposition", "")
-    m = re.search(r'filename\*?=(?:utf-8\'\')?["\']?([^\s";\']+)', disp, re.IGNORECASE)
-    if m:
-        suffixes = "".join(Path(m.group(1).strip("\"'")).suffixes)
-        if suffixes:
-            return suffixes
-
-    ct = resp_headers.get("content-type", "").lower()
-    if "zip" in ct:
-        return ".zip"
-    if "octet-stream" not in ct and ct:
-        # Any named type that isn't a generic binary blob — trust it
-        ext = {"application/vnd.ms-outlook": ".pst"}.get(ct.split(";")[0].strip())
-        if ext:
-            return ext
-
-    return ".pst"
-
-
-def migrate_misnamed_downloads(output_dir: Path, state: StateManager, logger: logging.Logger) -> None:
-    """
-    Rename any .pst.zip files that are actually bare PST files (magic bytes !BDN).
-    Updates the state record so the filename stays accurate.
-    """
-    for zip_path in sorted(output_dir.glob("*.pst.zip")):
-        try:
-            with open(zip_path, "rb") as f:
-                magic = f.read(4)
-        except OSError:
-            continue
-
-        if magic != _PST_MAGIC:
-            continue  # it really is a zip (or something else) — leave it alone
-
-        pst_path = zip_path.with_suffix("")  # strips .zip → leaves .pst
-        if pst_path.exists():
-            logger.warning(f"Cannot rename {zip_path.name}: {pst_path.name} already exists.")
-            continue
-
-        zip_path.rename(pst_path)
-        logger.info(f"Renamed {zip_path.name} → {pst_path.name}")
-
-        for info in state.state["completed"].values():
-            if info.get("filename") == zip_path.name:
-                info["filename"] = pst_path.name
-
-    state.save()
-
-
 async def download_file(
     download_url: str,
     cookies: dict,
@@ -951,34 +758,26 @@ async def download_file(
     user_name: str,
     service_id: str,
     logger: logging.Logger,
+    on_progress=None,
 ) -> str | None:
-    """
-    Streams the export file to disk. Returns the filename on success, None on failure.
-    Uses httpx for streaming — Playwright is not suitable for 100 GB files.
-    The file extension is determined from the server's response headers rather than
-    assumed, since Backupify serves raw PST files rather than zips.
-    """
     if download_url.startswith("/"):
         download_url = BASE_URL + download_url
 
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
     safe_name     = re.sub(r'[<>:"/\\|?*\s]', "_", user_name).strip("_")
-    stem          = f"{safe_name}__{service_id}"
+    filename      = output_dir / f"{safe_name}__{service_id}.pst.zip"
+    part_file     = filename.with_suffix(".zip.part")
 
-    # Safety check: if a file with any expected extension already exists, skip.
-    for ext in (".pst", ".pst.zip", ".zip"):
-        existing = output_dir / f"{stem}{ext}"
-        if existing.exists():
-            size_mb = existing.stat().st_size / 1024 / 1024
-            logger.info(f"[{service_id}] File already exists ({existing.name}, {size_mb:.1f} MB), skipping.")
-            return existing.name
+    if filename.exists():
+        size_mb = filename.stat().st_size / 1_048_576
+        logger.info(f"[{service_id}] File already exists ({size_mb:.1f} MB), skipping.")
+        return filename.name
 
-    # Use a generic part file while streaming; rename to the correct extension once
-    # the server's Content-Disposition / Content-Type headers are known.
-    part_file = output_dir / f"{stem}.part"
     if part_file.exists():
         logger.info(f"[{service_id}] Removing stale partial file {part_file.name}")
         part_file.unlink()
+
+    logger.info(f"[{service_id}] Downloading → {filename.name}")
 
     try:
         async with httpx.AsyncClient(
@@ -997,28 +796,18 @@ async def download_file(
                     logger.error(f"[{service_id}] Download HTTP {resp.status_code}")
                     return None
 
-                ext      = _infer_extension(dict(resp.headers))
-                filename = output_dir / f"{stem}{ext}"
-                total    = int(resp.headers.get("content-length", 0))
-                desc     = f"{safe_name[:35]:<35}"
+                total      = int(resp.headers.get("content-length", 0))
+                downloaded = 0
 
-                logger.info(f"[{service_id}] Downloading to {filename.name}")
-
-                with tqdm(
-                    total=total or None,
-                    unit="B",
-                    unit_scale=True,
-                    unit_divisor=1024,
-                    desc=desc,
-                    leave=False,
-                ) as bar:
-                    with open(part_file, "wb") as f:
-                        async for chunk in resp.aiter_bytes(CHUNK_SIZE):
-                            f.write(chunk)
-                            bar.update(len(chunk))
+                with open(part_file, "wb") as f:
+                    async for chunk in resp.aiter_bytes(CHUNK_SIZE):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if on_progress:
+                            on_progress(downloaded, total)
 
         part_file.rename(filename)
-        size_mb = filename.stat().st_size / 1024 / 1024
+        size_mb = filename.stat().st_size / 1_048_576
         logger.info(f"[{service_id}] Saved {filename.name} ({size_mb:.1f} MB)")
         return filename.name
 
@@ -1029,224 +818,816 @@ async def download_file(
         return None
 
 
-# ─── Per-user worker ──────────────────────────────────────────────────────────
+# ─── TUI — sort helpers ───────────────────────────────────────────────────────
 
-async def process_user(
-    user: dict,
-    context: BrowserContext,
-    cookies: dict,
-    state: StateManager,
-    output_dir: Path,
-    semaphore: asyncio.Semaphore,
-    logger: logging.Logger,
-    bar: tqdm,
-):
-    service_id = user["service_id"]
-    name       = user.get("name") or user.get("email") or service_id
+_SORT_OPTIONS = [
+    ("Alphabetical (A → Z)",   "az"),
+    ("Alphabetical (Z → A)",   "za"),
+    ("Largest mailbox first",  "size_desc"),
+    ("Smallest mailbox first", "size_asc"),
+]
 
-    async with semaphore:
-        try:
-            # 1. Snapshot ID — already in user dict from customerServices; fall
-            #    back to per-service page only if somehow missing.
-            snapshot_id = user.get("snapshot_id") or await get_latest_snapshot_id(context, service_id, logger)
-            if not snapshot_id:
-                state.mark_failed(service_id, "Could not determine snapshot ID")
-                return
+_STATUS_ICONS = {
+    "queued":      "○",
+    "triggering":  "⟳",
+    "polling":     "⟳",
+    "resuming":    "⟳",
+    "downloading": "↓",
+    "complete":    "✓",
+    "failed":      "✗",
+    "skipped":     "—",
+}
 
-            # 2. Trigger the export — or resume an already-triggered job.
-            existing = state.get_in_progress(service_id)
-            if existing:
-                job_id = existing["job_id"]
-                logger.info(f"[{service_id}] Resuming existing export job {job_id} (triggered at {existing['triggered_at']})")
-            else:
-                job_id = await trigger_export(context, cookies, service_id, snapshot_id, logger)
-                if not job_id:
-                    state.mark_failed(service_id, "Export trigger failed")
-                    return
-                state.mark_in_progress(service_id, job_id, snapshot_id)
 
-            # 3. Poll until the export is ready
-            download_url = await poll_for_download_url(context, cookies, job_id, service_id, logger)
-            if not download_url:
-                state.mark_failed(service_id, "Export did not complete in time")
-                return
+def _sort_users(users: list[dict], key: str) -> list[dict]:
+    if key == "az":
+        return sorted(users, key=lambda u: u["name"].lower())
+    if key == "za":
+        return sorted(users, key=lambda u: u["name"].lower(), reverse=True)
+    # snapshot_id is epoch-ms — used as a size proxy until real size data is
+    # extracted (see ROADMAP.md: "Actual size-based sorting")
+    if key == "size_desc":
+        return sorted(users, key=lambda u: int(u.get("snapshot_id") or 0), reverse=True)
+    if key == "size_asc":
+        return sorted(users, key=lambda u: int(u.get("snapshot_id") or 0))
+    return users
 
-            # 4. Stream the file to disk
-            filename = await download_file(
-                download_url, cookies, output_dir, name, service_id, logger
+
+# ─── TUI — messages ───────────────────────────────────────────────────────────
+
+class SessionReady(Message):
+    pass
+
+
+class StatusUpdate(Message):
+    def __init__(self, text: str) -> None:
+        super().__init__()
+        self.text = text
+
+
+class UsersLoaded(Message):
+    def __init__(self, users: list[dict]) -> None:
+        super().__init__()
+        self.users = users
+
+
+class LogEntry(Message):
+    def __init__(self, level: str, text: str) -> None:
+        super().__init__()
+        self.level = level
+        self.text  = text
+
+
+class ExportUpdate(Message):
+    def __init__(self, service_id: str, status: str, detail: str = "") -> None:
+        super().__init__()
+        self.service_id = service_id
+        self.status     = status
+        self.detail     = detail
+
+
+class DownloadProgress(Message):
+    def __init__(self, service_id: str, done: int, total: int) -> None:
+        super().__init__()
+        self.service_id = service_id
+        self.done       = done
+        self.total      = total
+
+
+# ─── TUI — onboarding screen ──────────────────────────────────────────────────
+
+class OnboardingScreen(Screen):
+    CSS = """
+    OnboardingScreen { align: center middle; }
+    #ob-card {
+        width: 76;
+        height: auto;
+        max-height: 100%;
+        overflow-y: auto;
+        border: double $accent;
+        padding: 1 2;
+        background: $surface;
+    }
+    #ob-title {
+        text-align: center;
+        text-style: bold;
+        color: $accent;
+        padding-bottom: 1;
+    }
+    #ob-indicator { text-align: center; color: $text-muted; margin-bottom: 1; }
+    .ob-label { text-style: bold; margin-top: 1; }
+    .ob-hint  { color: $text-muted; margin-bottom: 1; }
+    ContentSwitcher { height: auto; }
+    ContentSwitcher > Vertical { height: auto; }
+    #ob-nav { height: 3; margin-top: 1; align: right middle; }
+    #ob-nav Button { margin-left: 1; }
+    """
+
+    _STEP_TITLES = ["Welcome", "Server details", "Account", "Defaults"]
+
+    def __init__(self, cfg: dict) -> None:
+        super().__init__()
+        self._cfg  = cfg
+        self._step = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ob-card"):
+            yield Static("⚡  Backupify Exporter — First Run Setup", id="ob-title")
+            yield Static(
+                f"Step 1 / {len(self._STEP_TITLES)}: {self._STEP_TITLES[0]}",
+                id="ob-indicator",
             )
-            if filename:
-                state.mark_complete(service_id, filename)
+            with ContentSwitcher(initial="ob-step-0"):
+                with Vertical(id="ob-step-0"):
+                    yield Static(
+                        "Welcome! This tool bulk-exports M365 mailboxes (and soon\n"
+                        "OneDrive, SharePoint, and Teams) from Backupify/Datto.\n\n"
+                        "You will need:\n"
+                        "  • Your Backupify admin account email\n"
+                        "  • The server URL and customer ID from the browser address bar\n\n"
+                        "Power user tip: once created you can edit the config directly:\n"
+                        f"  {CONFIG_FILE}",
+                        classes="ob-hint",
+                    )
+
+                with Vertical(id="ob-step-1"):
+                    yield Static(
+                        "Open Backupify in your browser. The URL looks like:\n"
+                        "  https://SERVER.backupify.com/CUSTOMER_ID/o365\n"
+                        "      ?external_customer_id=EXT_ID\n"
+                        "Copy each piece into the fields below.",
+                        classes="ob-hint",
+                    )
+                    yield Static("Server URL", classes="ob-label")
+                    yield Input(
+                        value=self._cfg["server"]["base_url"],
+                        placeholder="https://xxx-ext.backupify.com",
+                        id="ob-base-url",
+                    )
+                    yield Static("Customer ID  (the number in the URL path)", classes="ob-label")
+                    yield Input(
+                        value=self._cfg["server"]["customer_id"],
+                        placeholder="123456",
+                        id="ob-customer-id",
+                    )
+                    yield Static("External Customer ID  (may be blank)", classes="ob-label")
+                    yield Input(
+                        value=self._cfg["server"]["ext_customer_id"],
+                        placeholder="xxxxxxxx-xxxx-...",
+                        id="ob-ext-id",
+                    )
+
+                with Vertical(id="ob-step-2"):
+                    yield Static("Your Backupify admin account details.", classes="ob-hint")
+                    yield Static("Email address", classes="ob-label")
+                    yield Input(
+                        value=self._cfg["account"]["email"],
+                        placeholder="you@company.com",
+                        id="ob-email",
+                    )
+                    yield Static("Two-factor authentication", classes="ob-label")
+                    yield Select(
+                        [
+                            ("Yes — I enter a 6-digit code on login", "true"),
+                            ("No — password only",                    "false"),
+                        ],
+                        value="true" if self._cfg["account"]["totp_enabled"] else "false",
+                        allow_blank=False,
+                        id="ob-totp",
+                    )
+
+                with Vertical(id="ob-step-3"):
+                    yield Static(
+                        "Where should exports be saved, and how many run at once?\n"
+                        "Each service type gets its own subfolder (exchange/, onedrive/, ...).",
+                        classes="ob-hint",
+                    )
+                    yield Static("Default output directory", classes="ob-label")
+                    yield Input(
+                        value=self._cfg["defaults"]["output_dir"],
+                        placeholder="/path/to/exports",
+                        id="ob-output",
+                    )
+                    yield Static("Concurrent exports  (2–16 recommended)", classes="ob-label")
+                    yield Input(
+                        value=str(self._cfg["defaults"]["concurrency"]),
+                        placeholder="8",
+                        id="ob-concurrency",
+                    )
+
+            with Horizontal(id="ob-nav"):
+                yield Button("← Back", id="ob-back", variant="default", disabled=True)
+                yield Button("Next →", id="ob-next", variant="primary")
+
+    def _update_nav(self) -> None:
+        self.query_one("#ob-indicator", Static).update(
+            f"Step {self._step + 1} / {len(self._STEP_TITLES)}: "
+            f"{self._STEP_TITLES[self._step]}"
+        )
+        self.query_one("#ob-back", Button).disabled = (self._step == 0)
+        last = self._step == len(self._STEP_TITLES) - 1
+        self.query_one("#ob-next", Button).label = "Finish ✓" if last else "Next →"
+
+    def _collect(self) -> bool:
+        if self._step == 1:
+            base_url    = self.query_one("#ob-base-url",    Input).value.strip().rstrip("/")
+            customer_id = self.query_one("#ob-customer-id", Input).value.strip()
+            ext_id      = self.query_one("#ob-ext-id",      Input).value.strip()
+            if not base_url or not customer_id:
+                self.notify("Server URL and Customer ID are required.", severity="error")
+                return False
+            if not base_url.startswith("http"):
+                base_url = "https://" + base_url
+            self._cfg["server"]["base_url"]        = base_url
+            self._cfg["server"]["customer_id"]     = customer_id
+            self._cfg["server"]["ext_customer_id"] = ext_id
+
+        elif self._step == 2:
+            email    = self.query_one("#ob-email", Input).value.strip()
+            totp_val = self.query_one("#ob-totp",  Select).value
+            if not email or "@" not in email:
+                self.notify("A valid email address is required.", severity="error")
+                return False
+            self._cfg["account"]["email"]        = email
+            self._cfg["account"]["totp_enabled"] = (totp_val != "false")
+
+        elif self._step == 3:
+            out_dir  = self.query_one("#ob-output",      Input).value.strip()
+            conc_str = self.query_one("#ob-concurrency", Input).value.strip()
+            if not out_dir:
+                self.notify("Output directory is required.", severity="error")
+                return False
+            try:
+                conc = int(conc_str)
+                if not 1 <= conc <= 32:
+                    raise ValueError
+            except ValueError:
+                self.notify("Concurrency must be a whole number 1–32.", severity="error")
+                return False
+            self._cfg["defaults"]["output_dir"]  = out_dir
+            self._cfg["defaults"]["concurrency"] = conc
+
+        return True
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "ob-back":
+            self._step = max(0, self._step - 1)
+            self.query_one(ContentSwitcher).current = f"ob-step-{self._step}"
+            self._update_nav()
+
+        elif event.button.id == "ob-next":
+            if not self._collect():
+                return
+            if self._step == len(self._STEP_TITLES) - 1:
+                save_config(self._cfg)
+                self.app.exit(self._cfg)
             else:
-                state.mark_failed(service_id, "Download failed")
-
-        except Exception as e:
-            logger.error(f"[{service_id}] Unhandled error: {e}", exc_info=True)
-            state.mark_failed(service_id, str(e))
-        finally:
-            bar.update(1)
+                self._step += 1
+                self.query_one(ContentSwitcher).current = f"ob-step-{self._step}"
+                self._update_nav()
 
 
-# ─── Cookie extraction helper ─────────────────────────────────────────────────
+class OnboardingApp(App):
+    """Minimal host app for the onboarding wizard. exit() returns the config."""
 
-async def extract_cookies(context: BrowserContext) -> dict:
+    def __init__(self, cfg: dict) -> None:
+        super().__init__()
+        self._cfg = cfg
+
+    def on_mount(self) -> None:
+        self.push_screen(OnboardingScreen(self._cfg))
+
+
+# ─── TUI — main app ───────────────────────────────────────────────────────────
+
+class BackupifyApp(App):
+    TITLE = "Backupify Exporter"
+
+    CSS = """
+    TabbedContent { height: 1fr; }
+    /* Textual defaults TabPane + inner ContentSwitcher to height:auto, which
+       collapses children using percentage heights to 0 — pin them to fill */
+    TabbedContent > ContentSwitcher { height: 1fr; }
+    TabPane { height: 100%; }
+
+    #exchange-view { height: 100%; layout: vertical; }
+
+    #settings-bar {
+        height: 3;
+        padding: 0 1;
+        background: $boost;
+        align: left middle;
+    }
+    #settings-bar Label { width: auto; padding: 0 1; color: $text-muted; }
+    #output-dir-input  { width: 1fr; }
+    #concurrency-input { width: 6; }
+    #sort-select       { width: 30; }
+
+    #main-panel { height: 1fr; }
+
+    #user-panel {
+        width: 40%;
+        layout: vertical;
+        border-right: solid $primary;
+    }
+    #search-input { dock: top; }
+    #exchange-user-list { height: 1fr; }
+    #user-stats {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+        background: $boost;
+    }
+    #user-actions {
+        height: 3;
+        layout: horizontal;
+        background: $boost;
+        align: left middle;
+        padding: 0 1;
+    }
+    #user-actions Button { margin-right: 1; min-width: 8; }
+
+    #export-panel { width: 60%; layout: vertical; }
+    #progress-table { height: 1fr; }
+    #log-pane { height: 10; border-top: solid $primary; }
+
+    #control-bar {
+        height: 3;
+        layout: horizontal;
+        background: $boost;
+        align: left middle;
+        padding: 0 1;
+    }
+    #control-bar Button { margin-right: 1; }
+    #status-text { color: $text-muted; content-align: left middle; width: 1fr; height: 3; }
+
+    .coming-soon {
+        height: 100%;
+        content-align: center middle;
+        color: $text-muted;
+    }
     """
-    Pulls the session cookies from the Playwright context and returns
-    them as a plain dict for use in httpx requests.
-    """
-    all_cookies = await context.cookies()
-    wanted      = {"__backupify_session", "PHPSESSID"}
-    cookies     = {c["name"]: c["value"] for c in all_cookies if c["name"] in wanted}
 
-    missing = wanted - set(cookies.keys())
-    if missing:
-        # Log what we did find — helps diagnose if cookie names have changed
-        found = [c["name"] for c in all_cookies]
-        raise RuntimeError(
-            f"Missing expected session cookies: {missing}\n"
-            f"Cookies present: {found}\n"
-            f"Update the 'wanted' set in extract_cookies() if the names have changed."
+    BINDINGS = [
+        Binding("q",      "quit",          "Quit"),
+        Binding("ctrl+s", "start_export",  "Start"),
+        Binding("f5",     "refresh_users", "Refresh Users"),
+        Binding("ctrl+r", "retry_failed",  "Retry Failed"),
+    ]
+
+    def __init__(self, cfg: dict) -> None:
+        super().__init__()
+        self._cfg = cfg
+
+        self._pw_context: BrowserContext | None = None
+        self._cookies: dict = {}
+
+        # Exchange tab state — OneDrive/SharePoint/Teams get their own
+        # parallel sets when implemented (different entity types per tab)
+        self._exchange_users:    list[dict] = []
+        self._exchange_filtered: list[dict] = []
+        self._exchange_selected: set[str]   = set()
+        self._exchange_state:    StateManager | None = None
+        self._exchange_sort   = "az"
+        self._exchange_search = ""
+
+        self._bfy_logger:    logging.Logger | None = None
+        self._debug_log: logging.Logger | None = None
+        self._semaphore: asyncio.Semaphore | None = None
+        self._export_running = False
+
+    # ── Layout ────────────────────────────────────────────────────────────
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        with TabbedContent(initial="tab-exchange"):
+            with TabPane("📧 Exchange", id="tab-exchange"):
+                with Vertical(id="exchange-view"):
+                    with Horizontal(id="settings-bar"):
+                        yield Label("Output:")
+                        yield Input(
+                            value=self._cfg["defaults"]["output_dir"],
+                            placeholder="/path/to/exports",
+                            id="output-dir-input",
+                        )
+                        yield Label("Workers:")
+                        yield Input(
+                            value=str(self._cfg["defaults"]["concurrency"]),
+                            id="concurrency-input",
+                            restrict=r"[0-9]*",
+                        )
+                        yield Label("Sort:")
+                        yield Select(
+                            _SORT_OPTIONS,
+                            value="az",
+                            allow_blank=False,
+                            id="sort-select",
+                        )
+                    with Horizontal(id="main-panel"):
+                        with Vertical(id="user-panel"):
+                            yield Input(placeholder="🔍 Filter users…", id="search-input")
+                            yield SelectionList(id="exchange-user-list")
+                            yield Static("Loading…", id="user-stats")
+                            with Horizontal(id="user-actions"):
+                                yield Button("All",  id="btn-all",  variant="default")
+                                yield Button("None", id="btn-none", variant="default")
+                        with Vertical(id="export-panel"):
+                            yield DataTable(
+                                id="progress-table",
+                                zebra_stripes=True,
+                                cursor_type="row",
+                            )
+                            yield RichLog(id="log-pane", highlight=True, markup=True)
+                    with Horizontal(id="control-bar"):
+                        yield Button("▶ Start",        id="btn-start", variant="success", disabled=True)
+                        yield Button("↺ Retry Failed", id="btn-retry", variant="default")
+                        yield Static("⟳ Starting up…", id="status-text")
+
+            with TabPane("📁 OneDrive", id="tab-onedrive"):
+                yield Static("OneDrive export — coming soon (see ROADMAP.md)", classes="coming-soon")
+            with TabPane("📋 SharePoint", id="tab-sharepoint"):
+                yield Static("SharePoint export — coming soon (see ROADMAP.md)", classes="coming-soon")
+            with TabPane("💬 Teams", id="tab-teams"):
+                yield Static("Teams export — coming soon (see ROADMAP.md)", classes="coming-soon")
+        yield Footer()
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────
+
+    def on_mount(self) -> None:
+        global _export_scan_lock
+        apply_config(self._cfg)
+
+        exchange_dir = Path(self._cfg["defaults"]["output_dir"]) / "exchange"
+        exchange_dir.mkdir(parents=True, exist_ok=True)
+
+        self._exchange_state = StateManager(exchange_dir)
+        self._bfy_logger         = setup_logging(exchange_dir)
+        self._debug_log      = setup_playwright_debug_logging()
+        self._semaphore      = asyncio.Semaphore(int(self._cfg["defaults"]["concurrency"]))
+        _export_scan_lock    = asyncio.Lock()
+
+        table = self.query_one("#progress-table", DataTable)
+        table.add_column("Name",     key="name",   width=28)
+        table.add_column("Status",   key="status", width=15)
+        table.add_column("Progress", key="detail", width=40)
+
+        # Spinner over the user list until UsersLoaded arrives
+        self.query_one("#exchange-user-list", SelectionList).loading = True
+
+        self.init_session()
+
+    # ── Background workers ────────────────────────────────────────────────
+
+    @work(exclusive=True, group="session")
+    async def init_session(self) -> None:
+        self.post_message(LogEntry("info", "Starting session — checking saved cookies…"))
+
+        def _status(text: str) -> None:
+            self.post_message(StatusUpdate(f"⟳ {text}"))
+            self.post_message(LogEntry("info", text))
+
+        try:
+            context = await login(self._bfy_logger, self._debug_log, on_status=_status)
+            self._pw_context = context
+            self._cookies = await extract_cookies(context)
+            self.post_message(SessionReady())
+            self.post_message(StatusUpdate("⟳ Session ready — loading user list…"))
+            self.post_message(LogEntry("info", "Session ready — loading users…"))
+            self.load_users()
+        except Exception as exc:
+            self.post_message(StatusUpdate("✗ Session failed — see log pane"))
+            self.post_message(LogEntry("error", f"Session error: {exc}"))
+            self.query_one("#exchange-user-list", SelectionList).loading = False
+
+    @work(exclusive=True, group="users")
+    async def load_users(self) -> None:
+        try:
+            users = await get_all_users(self._pw_context, self._cookies, self._bfy_logger)
+            self.post_message(UsersLoaded(users))
+        except Exception as exc:
+            self.post_message(LogEntry("error", f"User load failed: {exc}"))
+
+    @work(group="preflight")
+    async def run_preflight(self, users: list[dict], output_dir: Path) -> None:
+        self.post_message(LogEntry("info", "Scanning existing export jobs…"))
+        try:
+            await refresh_export_cache(self._pw_context, self._bfy_logger)
+            self.post_message(LogEntry("info", f"Found {len(_export_cache)} existing job(s)."))
+        except Exception as exc:
+            self.post_message(LogEntry("warning", f"Export scan failed: {exc}"))
+
+        for user in users:
+            sid = user["service_id"]
+            if self._exchange_state.is_done(sid):
+                self.post_message(ExportUpdate(sid, "skipped", "already complete"))
+            else:
+                self.export_one_user(user, output_dir)
+
+    @work(group="exports")
+    async def export_one_user(self, user: dict, output_dir: Path) -> None:
+        sid  = user["service_id"]
+        name = user.get("name") or sid
+
+        async with self._semaphore:
+            try:
+                snapshot_id = user.get("snapshot_id") or await get_latest_snapshot_id(
+                    self._pw_context, sid, self._bfy_logger
+                )
+                if not snapshot_id:
+                    self._exchange_state.mark_failed(sid, "No snapshot ID")
+                    self.post_message(ExportUpdate(sid, "failed", "no snapshot"))
+                    return
+
+                existing = self._exchange_state.get_in_progress(sid)
+                if existing:
+                    job_id = existing["job_id"]
+                    self.post_message(ExportUpdate(sid, "resuming", f"job {job_id}"))
+                else:
+                    self.post_message(ExportUpdate(sid, "triggering"))
+                    job_id = await trigger_export(
+                        self._pw_context, self._cookies, sid, snapshot_id, self._bfy_logger
+                    )
+                    if not job_id:
+                        self._exchange_state.mark_failed(sid, "Trigger failed")
+                        self.post_message(ExportUpdate(sid, "failed", "trigger failed"))
+                        return
+                    self._exchange_state.mark_in_progress(sid, job_id, snapshot_id)
+
+                self.post_message(ExportUpdate(sid, "polling", f"job {job_id}"))
+                download_url = await poll_for_download_url(
+                    self._pw_context, job_id, sid, self._bfy_logger
+                )
+                if not download_url:
+                    self._exchange_state.mark_failed(sid, "Poll timed out or job failed")
+                    self.post_message(ExportUpdate(sid, "failed", "poll timeout"))
+                    return
+
+                self.post_message(ExportUpdate(sid, "downloading"))
+
+                def _on_progress(done: int, total: int) -> None:
+                    self.post_message(DownloadProgress(sid, done, total))
+
+                filename = await download_file(
+                    download_url, self._cookies, output_dir,
+                    name, sid, self._bfy_logger, on_progress=_on_progress,
+                )
+                if filename:
+                    self._exchange_state.mark_complete(sid, filename)
+                    self.post_message(ExportUpdate(sid, "complete", filename[:38]))
+                    self.post_message(LogEntry("success", f"✓ {name}  →  {filename}"))
+                else:
+                    self._exchange_state.mark_failed(sid, "Download failed")
+                    self.post_message(ExportUpdate(sid, "failed", "download error"))
+                    self.post_message(LogEntry("error", f"✗ {name}  download failed"))
+
+            except Exception as exc:
+                self._exchange_state.mark_failed(sid, str(exc))
+                self.post_message(ExportUpdate(sid, "failed", str(exc)[:38]))
+                self.post_message(LogEntry("error", f"✗ {name}: {exc}"))
+
+    # ── Worker→UI message handlers ────────────────────────────────────────
+
+    @on(SessionReady)
+    def _on_session_ready(self) -> None:
+        self.query_one("#status-text", Static).update("⟳ Session active — loading users…")
+
+    @on(StatusUpdate)
+    def _on_status_update(self, event: StatusUpdate) -> None:
+        self.query_one("#status-text", Static).update(event.text)
+
+    @on(UsersLoaded)
+    def _on_users_loaded(self, event: UsersLoaded) -> None:
+        self._exchange_users    = event.users
+        self._exchange_selected = {u["service_id"] for u in event.users}
+        self.query_one("#exchange-user-list", SelectionList).loading = False
+        self._refresh_user_list()
+        self.query_one("#status-text", Static).update(
+            f"✓ Ready — {len(event.users)} mailboxes loaded. Select users and press Start."
         )
-    return cookies
+        if not self._export_running:
+            self.query_one("#btn-start", Button).disabled = False
+        self.notify(f"Ready — {len(event.users)} mailboxes loaded.", title="Backupify")
 
-
-# ─── Main ─────────────────────────────────────────────────────────────────────
-
-async def main(output_dir: Path, concurrency: int, resume: bool, dry_run: bool):
-    global _export_scan_lock
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    logger    = setup_logging(output_dir)
-    debug_log = setup_playwright_debug_logging()
-    state     = StateManager(output_dir)
-    _export_scan_lock = asyncio.Lock()
-
-    logger.info("=" * 60)
-    logger.info("Backupify PST Bulk Exporter")
-    logger.info(f"Output dir   : {output_dir}")
-    logger.info(f"Concurrency  : {concurrency}")
-    logger.info(f"Resume mode  : {resume}")
-    logger.info(f"Playwright debug log: playwright_debug.log")
-    logger.info("=" * 60)
-
-    # ── 0. Migrate any previously-downloaded files that have the wrong extension ──
-    migrate_misnamed_downloads(output_dir, state, logger)
-
-    # ── 1. Login ──
-    context = await login(logger, debug_log)
-
-    try:
-        # ── 2. Extract session cookies for httpx calls ──
-        cookies = await extract_cookies(context)
-        logger.info(f"Session cookies captured: {list(cookies.keys())}")
-
-        # ── 3. Discover all Exchange users ──
-        users = await get_all_users(context, cookies, logger)
-        logger.info(f"Total users: {len(users)}")
-
-        # ── 4. Filter users ──
-        # Completed users are always skipped (re-running the script is safe).
-        # In-progress users (export triggered but not yet downloaded) skip
-        # straight to polling — no second trigger.
-        # Failed users are skipped when --resume is set; retried otherwise.
-        pending = [u for u in users if not state.is_done(u["service_id"])]
-        if resume:
-            pending = [u for u in pending if not state.is_failed(u["service_id"])]
-
-        n_done      = sum(1 for u in users if state.is_done(u["service_id"]))
-        n_resuming  = sum(1 for u in pending if state.get_in_progress(u["service_id"]))
-        n_failed    = sum(1 for u in users if state.is_failed(u["service_id"]))
-        logger.info(
-            f"Status: {n_done} completed, {n_resuming} resuming from poll, "
-            f"{n_failed} failed ({'skipped' if resume else 'will retry'}), "
-            f"{len(pending)} to process."
+    @on(LogEntry)
+    def _on_log_entry(self, event: LogEntry) -> None:
+        colour = {
+            "info": "white", "warning": "yellow",
+            "error": "red", "success": "green",
+        }.get(event.level, "white")
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.query_one("#log-pane", RichLog).write(
+            f"[{colour}]{ts}  {event.text}[/{colour}]"
         )
 
-        # Clean up any leftover partial download files from a previous run
-        for part_file in output_dir.glob("*.part"):
-            logger.info(f"Cleaning up stale partial file: {part_file.name}")
-            part_file.unlink()
+    @on(ExportUpdate)
+    def _on_export_update(self, event: ExportUpdate) -> None:
+        icon  = _STATUS_ICONS.get(event.status, "?")
+        table = self.query_one("#progress-table", DataTable)
+        try:
+            table.update_cell(event.service_id, "status", f"{icon} {event.status.capitalize()}")
+            if event.detail:
+                table.update_cell(event.service_id, "detail", event.detail)
+        except Exception:
+            pass  # row may not exist (e.g. update for a user not in this run)
+        if event.status in ("complete", "failed", "skipped"):
+            self._update_stats()
 
-        # ── 5. Discover export API + preflight scan ──
-        # Navigate to the export page once to find the real JSON endpoint URL
-        # and pre-load any jobs that were triggered in a previous session.
-        await discover_and_scan_exports(context, cookies, state, logger)
+    @on(DownloadProgress)
+    def _on_download_progress(self, event: DownloadProgress) -> None:
+        if event.total:
+            pct      = min(100, int(event.done / event.total * 100))
+            done_mb  = event.done  / 1_048_576
+            total_mb = event.total / 1_048_576
+            filled   = pct // 5
+            bar      = "█" * filled + "░" * (20 - filled)
+            detail   = f"{bar} {pct:3d}%  {done_mb:.0f}/{total_mb:.0f} MB"
+        else:
+            detail = f"{event.done / 1_048_576:.0f} MB"
+        try:
+            self.query_one("#progress-table", DataTable).update_cell(
+                event.service_id, "detail", detail
+            )
+        except Exception:
+            pass
 
-        # Recalculate n_resuming after the scan may have added entries
-        n_resuming = sum(1 for u in pending if state.get_in_progress(u["service_id"]))
-        if n_resuming:
-            logger.info(f"  {n_resuming} will resume from polling (export already triggered).")
+    # ── UI event handlers ─────────────────────────────────────────────────
 
-        # ── 6. Dry run ──
-        if dry_run:
-            logger.info("DRY RUN — users that would be exported:")
-            for u in pending:
-                logger.info(f"  {u['name']:<45} {u['email']:<45} serviceId={u['service_id']}  snapshotId={u.get('snapshot_id') or 'NONE'}")
+    @on(Input.Changed, "#search-input")
+    def _on_search(self, event: Input.Changed) -> None:
+        self._exchange_search = event.value
+        self._refresh_user_list()
+
+    @on(Select.Changed, "#sort-select")
+    def _on_sort(self, event: Select.Changed) -> None:
+        if event.value is not Select.BLANK:
+            self._exchange_sort = str(event.value)
+            self._refresh_user_list()
+
+    @on(Input.Changed, "#output-dir-input")
+    def _on_output_dir_changed(self, event: Input.Changed) -> None:
+        if event.value.strip():
+            self._cfg["defaults"]["output_dir"] = event.value.strip()
+
+    @on(Input.Changed, "#concurrency-input")
+    def _on_concurrency_changed(self, event: Input.Changed) -> None:
+        try:
+            n = int(event.value)
+        except ValueError:
+            return
+        if 1 <= n <= 32:
+            self._cfg["defaults"]["concurrency"] = n
+            if not self._export_running:
+                self._semaphore = asyncio.Semaphore(n)
+
+    @on(SelectionList.SelectedChanged, "#exchange-user-list")
+    def _on_user_selection(self, event: SelectionList.SelectedChanged) -> None:
+        visible_ids    = {u["service_id"] for u in self._exchange_filtered}
+        newly_selected = set(event.selection_list.selected)
+        self._exchange_selected = (self._exchange_selected - visible_ids) | newly_selected
+        self._update_stats()
+
+    @on(Button.Pressed, "#btn-all")
+    def _on_select_all(self) -> None:
+        self._exchange_selected |= {u["service_id"] for u in self._exchange_filtered}
+        self._refresh_user_list()
+
+    @on(Button.Pressed, "#btn-none")
+    def _on_select_none(self) -> None:
+        self._exchange_selected -= {u["service_id"] for u in self._exchange_filtered}
+        self._refresh_user_list()
+
+    @on(Button.Pressed, "#btn-start")
+    def _on_btn_start(self) -> None:
+        self.action_start_export()
+
+    @on(Button.Pressed, "#btn-retry")
+    def _on_btn_retry(self) -> None:
+        self.action_retry_failed()
+
+    # ── Actions ───────────────────────────────────────────────────────────
+
+    def action_start_export(self) -> None:
+        if not self._pw_context:
+            self.notify("Session not ready yet — please wait.", severity="warning")
+            return
+        if self._export_running:
+            self.notify("Export already running.", severity="warning")
             return
 
-        if not pending:
-            logger.info("Nothing to do.")
-            return
-
-        logger.info(f"Starting export of {len(pending)} mailboxes ({concurrency} concurrent)...")
-
-        # ── 6. Run workers ──
-        semaphore = asyncio.Semaphore(concurrency)
-        bar = tqdm(total=len(pending), desc="Overall progress", unit="mailbox", position=0)
-
-        tasks = [
-            process_user(u, context, cookies, state, output_dir, semaphore, logger, bar)
-            for u in pending
+        selected = [
+            u for u in self._exchange_users
+            if u["service_id"] in self._exchange_selected
         ]
-        await asyncio.gather(*tasks)
-        bar.close()
+        if not selected:
+            self.notify("No users selected.", severity="warning")
+            return
 
-    finally:
-        # Always close the browser, even on error
-        await context.browser.close()
+        selected   = _sort_users(selected, self._exchange_sort)
+        output_dir = Path(self._cfg["defaults"]["output_dir"]) / "exchange"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        save_config(self._cfg)
 
-    # ── 7. Summary ──
-    summary = state.summary()
-    logger.info("")
-    logger.info("=" * 60)
-    logger.info("COMPLETE")
-    logger.info(f"  Completed    : {summary['completed']}")
-    logger.info(f"  In-progress  : {summary['in_progress']}  (re-run to resume polling)")
-    logger.info(f"  Failed       : {summary['failed']}")
-    logger.info("=" * 60)
+        self._export_running = True
+        self.query_one("#btn-start", Button).disabled = True
 
-    if state.state["failed"]:
-        logger.info("Failed mailboxes:")
-        for sid, info in state.state["failed"].items():
-            logger.info(f"  {sid} — {info['reason']}")
+        table = self.query_one("#progress-table", DataTable)
+        table.clear()
+        for user in selected:
+            table.add_row(
+                user["name"][:28], "○ Queued", "",
+                key=user["service_id"],
+            )
+
+        self.post_message(StatusUpdate(f"⟳ Exporting {len(selected)} mailbox(es)…"))
+        self.post_message(LogEntry("info", f"Starting export for {len(selected)} user(s)…"))
+        self.run_preflight(selected, output_dir)
+
+    def action_refresh_users(self) -> None:
+        if not self._pw_context:
+            self.notify("Session not ready yet.", severity="warning")
+            return
+        if USERS_FILE.exists():
+            USERS_FILE.unlink()
+        self.query_one("#exchange-user-list", SelectionList).loading = True
+        self.post_message(StatusUpdate("⟳ Re-fetching user list from Backupify…"))
+        self.post_message(LogEntry("info", "User cache cleared — re-fetching…"))
+        self.load_users()
+
+    def action_retry_failed(self) -> None:
+        if not self._exchange_state:
+            return
+        n = len(self._exchange_state.state["failed"])
+        if n == 0:
+            self.notify("No failed exports to retry.")
+            return
+        self._exchange_state.state["failed"].clear()
+        self._exchange_state.save()
+        self._export_running = False
+        self.query_one("#btn-start", Button).disabled = False
+        self.notify(f"Cleared {n} failed entr{'y' if n == 1 else 'ies'} — press Start to retry.")
+        self._refresh_user_list()
+
+    def action_quit(self) -> None:
+        save_config(self._cfg)
+        self.exit()
+
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    def _refresh_user_list(self) -> None:
+        search = self._exchange_search.lower()
+        filtered = [
+            u for u in self._exchange_users
+            if not search
+            or search in u["name"].lower()
+            or search in (u.get("email") or "").lower()
+        ]
+        self._exchange_filtered = _sort_users(filtered, self._exchange_sort)
+
+        sl    = self.query_one("#exchange-user-list", SelectionList)
+        state = self._exchange_state
+        sl.clear_options()
+        for user in self._exchange_filtered:
+            sid = user["service_id"]
+            if state and state.is_done(sid):
+                label = f"✓ {user['name']}"
+            elif state and state.get_in_progress(sid):
+                label = f"⟳ {user['name']}"
+            elif state and state.is_failed(sid):
+                label = f"✗ {user['name']}"
+            else:
+                label = f"  {user['name']}"
+            sl.add_option(Selection(label, sid, sid in self._exchange_selected))
+
+        self._update_stats()
+
+    def _update_stats(self) -> None:
+        state = self._exchange_state
+        total = len(self._exchange_users)
+        if state:
+            done    = len(state.state["completed"])
+            in_prog = len(state.state["in_progress"])
+            failed  = len(state.state["failed"])
+            queued  = max(0, total - done - in_prog - failed)
+        else:
+            done = in_prog = failed = queued = 0
+        try:
+            self.query_one("#user-stats", Static).update(
+                f"✓ {done}  ⟳ {in_prog}  ✗ {failed}  ○ {queued}"
+                f"  │  {len(self._exchange_selected)}/{total} selected"
+            )
+        except Exception:
+            pass
 
 
-# ─── CLI ──────────────────────────────────────────────────────────────────────
-
-def parse_args():
-    p = argparse.ArgumentParser(
-        description="Bulk export Backupify M365 Exchange mailboxes as PST files.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  uv run backupify_export.py --output /mnt/usb_drive
-  uv run backupify_export.py --output /mnt/usb_drive --resume
-  uv run backupify_export.py --output /mnt/usb_drive --dry-run
-  uv run backupify_export.py --output /mnt/usb_drive --concurrency 5
-        """,
-    )
-    p.add_argument("--output",      "-o", required=True,      help="Directory for PST files and logs.")
-    p.add_argument("--concurrency", "-c", type=int, default=8, help="Parallel exports (default: 8).")
-    p.add_argument("--resume",      "-r", action="store_true", help="Skip already-completed mailboxes.")
-    p.add_argument("--dry-run",           action="store_true", help="List users without exporting.")
-    return p.parse_args()
-
+# ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    args = parse_args()
-    asyncio.run(main(
-        output_dir=Path(args.output),
-        concurrency=args.concurrency,
-        resume=args.resume,
-        dry_run=args.dry_run,
-    ))
+    _cfg = load_config()
+
+    if not config_is_complete(_cfg):
+        result = OnboardingApp(_cfg).run()
+        if not (result and config_is_complete(result)):
+            raise SystemExit("Setup not completed — exiting.")
+        _cfg = result
+
+    BackupifyApp(_cfg).run()
