@@ -24,6 +24,7 @@ Then just run:
 
 import asyncio
 import copy
+import html
 import json
 import logging
 import re
@@ -34,6 +35,8 @@ from pathlib import Path
 
 import httpx
 from playwright.async_api import async_playwright, BrowserContext, TimeoutError as PWTimeout
+
+from rich.markup import escape as rich_escape
 
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -427,6 +430,9 @@ async def get_all_users(
         try:
             users = json.loads(USERS_FILE.read_text(encoding="utf-8"))
             if users:
+                for u in users:  # older caches stored HTML entities (&#039; etc.)
+                    u["name"]  = html.unescape(u.get("name")  or "")
+                    u["email"] = html.unescape(u.get("email") or "")
                 logger.info(f"Loaded {len(users)} users from cache ({USERS_FILE}).")
                 return users
         except Exception as e:
@@ -502,8 +508,8 @@ async def get_all_users(
         service_id = str(row.get("id") or "")
         if not service_id:
             continue
-        name  = re.sub(r"<[^>]+>", "", str(row.get("name")  or "")).strip()
-        email = re.sub(r"<[^>]+>", "", str(row.get("email") or "")).strip()
+        name  = html.unescape(re.sub(r"<[^>]+>", "", str(row.get("name")  or ""))).strip()
+        email = html.unescape(re.sub(r"<[^>]+>", "", str(row.get("email") or ""))).strip()
         backups     = row.get("perfectBackups") or []
         snapshot_id = (
             str(max(backups, key=lambda b: b.get("snapshotId", 0))["snapshotId"])
@@ -653,6 +659,8 @@ async def scan_export_page(context: BrowserContext, logger: logging.Logger) -> l
             logger.info("Export table empty — no export jobs yet.")
             return []
 
+        prev_first: str | None = None
+        pages = 0
         while True:
             batch = await page.evaluate("""() => {
                 const rows = document.querySelectorAll('#exportListItems tbody tr');
@@ -673,6 +681,11 @@ async def scan_export_page(context: BrowserContext, logger: logging.Logger) -> l
                 });
             }""")
 
+            first_id = batch[0]["job_id"] if batch else None
+            if first_id is not None and first_id == prev_first:
+                break  # pagination didn't advance — we're done
+            prev_first = first_id
+
             for row in batch:
                 href = row.pop("download_href") or ""
                 if href and not href.startswith("http"):
@@ -681,11 +694,17 @@ async def scan_export_page(context: BrowserContext, logger: logging.Logger) -> l
                 row["source_name"]  = row.pop("source")
                 records.append(row)
 
+            pages += 1
+            if pages >= 40:
+                logger.warning("Export page scan stopped after 40 pages.")
+                break
             next_btn = await page.query_selector("#exportListItems_next:not(.disabled)")
             if not next_btn:
                 break
             await next_btn.click()
-            await page.wait_for_load_state("networkidle", timeout=15_000)
+            # The export page runs heartbeat XHRs, so "networkidle" never
+            # settles — give the AJAX redraw a fixed moment to land instead.
+            await page.wait_for_timeout(2_500)
 
     except PWTimeout as e:
         logger.warning(f"Timeout loading export page: {e}")
@@ -710,13 +729,22 @@ async def poll_for_download_url(
     job_id: str,
     service_id: str,
     logger: logging.Logger,
-) -> str | None:
+    on_status=None,
+) -> tuple[str, str | None]:
     """
-    Waits until the export job is completed and returns its download URL.
+    Waits until the export job is completed and returns (outcome, url):
+      ("ok", url)       — job completed, download URL available
+      ("missing", None) — job never appeared on the export page (stale job id)
+      ("failed", None)  — job ended in failed/error/cancelled
+      ("timeout", None) — EXPORT_TIMEOUT exceeded
+
     All concurrent workers share one page-scan via _export_scan_lock.
+    on_status: optional callable(str) for live UI updates each poll.
     """
-    deadline = time.monotonic() + EXPORT_TIMEOUT
-    attempt  = 0
+    start          = time.monotonic()
+    deadline       = start + EXPORT_TIMEOUT
+    unseen_scans   = 0
+    last_scan_time = _export_cache_time
 
     while time.monotonic() < deadline:
         cache_age = time.monotonic() - _export_cache_time
@@ -725,31 +753,48 @@ async def poll_for_download_url(
                 if time.monotonic() - _export_cache_time >= POLL_INTERVAL:
                     await refresh_export_cache(context, logger)
 
-        record = _export_cache.get(str(job_id))
+        record  = _export_cache.get(str(job_id))
+        elapsed = int(time.monotonic() - start)
+
         if record:
+            unseen_scans = 0
             status = record["status"]
+            if on_status:
+                on_status(f"job {job_id}: {status} · {elapsed // 60}m {elapsed % 60:02d}s")
             if status == "completed":
                 url = record["download_url"]
                 if url:
-                    logger.info(f"[{service_id}] Export ready after {attempt} poll(s).")
-                    return url
+                    logger.info(f"[{service_id}] Export ready after {elapsed}s.")
+                    return ("ok", url)
             elif status in ("failed", "error", "cancelled"):
                 logger.error(f"[{service_id}] Export job {job_id} ended: {status}")
-                return None
-
-        attempt += 1
-        if attempt % 4 == 0:
-            elapsed = int(time.monotonic() - (deadline - EXPORT_TIMEOUT))
-            last    = record["status"] if record else "not seen"
-            logger.info(f"[{service_id}] Still waiting {elapsed}s (job {job_id}, last: {last})")
+                return ("failed", None)
+        else:
+            # Count scans that completed while the job was still absent
+            if _export_cache_time != last_scan_time:
+                unseen_scans  += 1
+                last_scan_time = _export_cache_time
+            if on_status:
+                on_status(f"job {job_id}: not listed yet (scan {unseen_scans}/4)")
+            if unseen_scans >= 4:
+                logger.warning(
+                    f"[{service_id}] Job {job_id} absent after {unseen_scans} scans — treating as stale."
+                )
+                return ("missing", None)
 
         await asyncio.sleep(POLL_INTERVAL)
 
     logger.error(f"[{service_id}] Export timed out after {EXPORT_TIMEOUT}s.")
-    return None
+    return ("timeout", None)
 
 
 # ─── File download ────────────────────────────────────────────────────────────
+
+def pst_path(output_dir: Path, user_name: str, service_id: str) -> Path:
+    """Canonical on-disk path for a mailbox export (server sends raw PST)."""
+    safe_name = re.sub(r'[<>:"/\\|?*\s]', "_", user_name).strip("_")
+    return output_dir / f"{safe_name}__{service_id}.pst"
+
 
 async def download_file(
     download_url: str,
@@ -764,9 +809,8 @@ async def download_file(
         download_url = BASE_URL + download_url
 
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-    safe_name     = re.sub(r'[<>:"/\\|?*\s]', "_", user_name).strip("_")
-    filename      = output_dir / f"{safe_name}__{service_id}.pst.zip"
-    part_file     = filename.with_suffix(".zip.part")
+    filename      = pst_path(output_dir, user_name, service_id)
+    part_file     = filename.with_name(filename.name + ".part")
 
     if filename.exists():
         size_mb = filename.stat().st_size / 1_048_576
@@ -1195,6 +1239,7 @@ class BackupifyApp(App):
         self._debug_log: logging.Logger | None = None
         self._semaphore: asyncio.Semaphore | None = None
         self._export_running = False
+        self._run_pending: set[str] = set()  # service_ids not yet finished this run
 
     # ── Layout ────────────────────────────────────────────────────────────
 
@@ -1328,6 +1373,14 @@ class BackupifyApp(App):
         sid  = user["service_id"]
         name = user.get("name") or sid
 
+        # Already on disk (e.g. downloaded by an earlier version) — don't
+        # trigger a fresh server-side export for it.
+        existing_file = pst_path(output_dir, name, sid)
+        if existing_file.exists():
+            self._exchange_state.mark_complete(sid, existing_file.name)
+            self.post_message(ExportUpdate(sid, "skipped", "already on disk"))
+            return
+
         async with self._semaphore:
             try:
                 snapshot_id = user.get("snapshot_id") or await get_latest_snapshot_id(
@@ -1339,6 +1392,7 @@ class BackupifyApp(App):
                     return
 
                 existing = self._exchange_state.get_in_progress(sid)
+                resumed  = bool(existing)
                 if existing:
                     job_id = existing["job_id"]
                     self.post_message(ExportUpdate(sid, "resuming", f"job {job_id}"))
@@ -1353,13 +1407,40 @@ class BackupifyApp(App):
                         return
                     self._exchange_state.mark_in_progress(sid, job_id, snapshot_id)
 
+                def _poll_status(text: str) -> None:
+                    self.post_message(ExportUpdate(sid, "polling", text))
+
                 self.post_message(ExportUpdate(sid, "polling", f"job {job_id}"))
-                download_url = await poll_for_download_url(
-                    self._pw_context, job_id, sid, self._bfy_logger
+                outcome, download_url = await poll_for_download_url(
+                    self._pw_context, job_id, sid, self._bfy_logger,
+                    on_status=_poll_status,
                 )
+
+                if outcome == "missing" and resumed:
+                    # Saved job id from an earlier session no longer exists on
+                    # the export page — start a fresh export instead.
+                    self.post_message(ExportUpdate(sid, "triggering", "stale job — re-exporting"))
+                    self.post_message(LogEntry(
+                        "warning", f"{name}: saved job {job_id} is gone — re-triggering export."
+                    ))
+                    self._exchange_state.clear_in_progress(sid)
+                    job_id = await trigger_export(
+                        self._pw_context, self._cookies, sid, snapshot_id, self._bfy_logger
+                    )
+                    if not job_id:
+                        self._exchange_state.mark_failed(sid, "Re-trigger failed")
+                        self.post_message(ExportUpdate(sid, "failed", "re-trigger failed"))
+                        return
+                    self._exchange_state.mark_in_progress(sid, job_id, snapshot_id)
+                    self.post_message(ExportUpdate(sid, "polling", f"job {job_id}"))
+                    outcome, download_url = await poll_for_download_url(
+                        self._pw_context, job_id, sid, self._bfy_logger,
+                        on_status=_poll_status,
+                    )
+
                 if not download_url:
-                    self._exchange_state.mark_failed(sid, "Poll timed out or job failed")
-                    self.post_message(ExportUpdate(sid, "failed", "poll timeout"))
+                    self._exchange_state.mark_failed(sid, f"Export {outcome}")
+                    self.post_message(ExportUpdate(sid, "failed", f"export {outcome}"))
                     return
 
                 self.post_message(ExportUpdate(sid, "downloading"))
@@ -1388,15 +1469,15 @@ class BackupifyApp(App):
     # ── Worker→UI message handlers ────────────────────────────────────────
 
     @on(SessionReady)
-    def _on_session_ready(self) -> None:
+    def _handle_session_ready(self) -> None:
         self.query_one("#status-text", Static).update("⟳ Session active — loading users…")
 
     @on(StatusUpdate)
-    def _on_status_update(self, event: StatusUpdate) -> None:
+    def _handle_status_update(self, event: StatusUpdate) -> None:
         self.query_one("#status-text", Static).update(event.text)
 
     @on(UsersLoaded)
-    def _on_users_loaded(self, event: UsersLoaded) -> None:
+    def _handle_users_loaded(self, event: UsersLoaded) -> None:
         self._exchange_users    = event.users
         self._exchange_selected = {u["service_id"] for u in event.users}
         self.query_one("#exchange-user-list", SelectionList).loading = False
@@ -1409,18 +1490,18 @@ class BackupifyApp(App):
         self.notify(f"Ready — {len(event.users)} mailboxes loaded.", title="Backupify")
 
     @on(LogEntry)
-    def _on_log_entry(self, event: LogEntry) -> None:
+    def _handle_log_entry(self, event: LogEntry) -> None:
         colour = {
             "info": "white", "warning": "yellow",
             "error": "red", "success": "green",
         }.get(event.level, "white")
         ts = datetime.now().strftime("%H:%M:%S")
         self.query_one("#log-pane", RichLog).write(
-            f"[{colour}]{ts}  {event.text}[/{colour}]"
+            f"[{colour}]{ts}  {rich_escape(event.text)}[/{colour}]"
         )
 
     @on(ExportUpdate)
-    def _on_export_update(self, event: ExportUpdate) -> None:
+    def _handle_export_update(self, event: ExportUpdate) -> None:
         icon  = _STATUS_ICONS.get(event.status, "?")
         table = self.query_one("#progress-table", DataTable)
         try:
@@ -1431,9 +1512,13 @@ class BackupifyApp(App):
             pass  # row may not exist (e.g. update for a user not in this run)
         if event.status in ("complete", "failed", "skipped"):
             self._update_stats()
+            if self._export_running and event.service_id in self._run_pending:
+                self._run_pending.discard(event.service_id)
+                if not self._run_pending:
+                    self._finish_run()
 
     @on(DownloadProgress)
-    def _on_download_progress(self, event: DownloadProgress) -> None:
+    def _handle_download_progress(self, event: DownloadProgress) -> None:
         if event.total:
             pct      = min(100, int(event.done / event.total * 100))
             done_mb  = event.done  / 1_048_576
@@ -1528,6 +1613,7 @@ class BackupifyApp(App):
         save_config(self._cfg)
 
         self._export_running = True
+        self._run_pending    = {u["service_id"] for u in selected}
         self.query_one("#btn-start", Button).disabled = True
 
         table = self.query_one("#progress-table", DataTable)
@@ -1567,8 +1653,30 @@ class BackupifyApp(App):
         self.notify(f"Cleared {n} failed entr{'y' if n == 1 else 'ies'} — press Start to retry.")
         self._refresh_user_list()
 
+    def _finish_run(self) -> None:
+        self._export_running = False
+        self.query_one("#btn-start", Button).disabled = False
+        done   = len(self._exchange_state.state["completed"])
+        failed = len(self._exchange_state.state["failed"])
+        self.query_one("#status-text", Static).update(
+            f"✓ Run finished — {done} complete, {failed} failed."
+        )
+        self.post_message(LogEntry("info", f"Run finished — {done} complete, {failed} failed."))
+        self.notify(f"Run finished — {done} complete, {failed} failed.", title="Backupify")
+        self._refresh_user_list()
+
     def action_quit(self) -> None:
         save_config(self._cfg)
+        self._close_browser_and_exit()
+
+    @work(group="shutdown")
+    async def _close_browser_and_exit(self) -> None:
+        # Close the headless browser so no orphan Chromium lingers
+        try:
+            if self._pw_context and self._pw_context.browser:
+                await self._pw_context.browser.close()
+        except Exception:
+            pass
         self.exit()
 
     # ── Helpers ───────────────────────────────────────────────────────────
