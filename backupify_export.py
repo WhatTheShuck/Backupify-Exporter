@@ -10,7 +10,7 @@
 Backupify M365 Bulk Exporter
 ============================
 TUI-driven tool for bulk-exporting Backupify/Datto M365 backups to local files.
-Supports Exchange PST; OneDrive, SharePoint, and Teams planned (see ROADMAP.md).
+Supports Exchange PST, OneDrive, and SharePoint; Teams planned (see ROADMAP.md).
 
 Configuration lives at ~/.config/backupify_exporter/config.toml — an onboarding
 wizard creates it on first run, or power users can write it by hand.
@@ -30,6 +30,7 @@ import logging
 import re
 import time
 import tomllib
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -48,7 +49,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
-from textual.screen import Screen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Button,
     ContentSwitcher,
@@ -136,6 +137,46 @@ def config_is_complete(cfg: dict) -> bool:
     return bool(s.get("base_url") and s.get("customer_id") and a.get("email"))
 
 
+# ─── Service registry ─────────────────────────────────────────────────────────
+#
+# Every Backupify service section shares the same machinery (customerServices
+# entity list, restoreExportAction trigger, /o365/<section>/export status
+# table) — only these knobs differ.  Discovered per-service via the playbook
+# in HANDOFF.md; don't guess values for new services.
+
+@dataclass(frozen=True)
+class ServiceDef:
+    key:           str          # internal id, also output subfolder + widget id prefix
+    label:         str          # tab title
+    noun:          str          # what one entity is called in the UI
+    noun_plural:   str
+    section:       str          # URL path segment under /o365/
+    app_type:      str          # appType in customerServices + restoreExportAction
+    export_format: str | None   # exportFormat field, or None if the modal has no format radios
+    file_ext:      str          # on-disk extension when the server names nothing better
+
+
+SERVICES: dict[str, ServiceDef] = {
+    "exchange": ServiceDef(
+        key="exchange", label="📧 Exchange", noun="mailbox", noun_plural="mailboxes",
+        section="exchange", app_type="office365_exchange",
+        export_format="pst", file_ext=".pst",   # raw PST, no zip wrapper (verified)
+    ),
+    "onedrive": ServiceDef(
+        key="onedrive", label="📁 OneDrive", noun="drive", noun_plural="drives",
+        section="onedrive", app_type="office365_onedrive",
+        export_format=None,                     # OneDrive export modal has no format choice
+        file_ext=".zip",
+    ),
+    "sharepoint": ServiceDef(
+        key="sharepoint", label="📋 SharePoint", noun="site", noun_plural="sites",
+        section="sharepoint", app_type="office365_sharepoint",
+        export_format=None,                     # SharePoint export modal has no format choice
+        file_ext=".zip",
+    ),
+}
+
+
 # ─── Runtime globals (set by apply_config before any business logic runs) ─────
 
 BASE_URL        = ""
@@ -143,16 +184,14 @@ CUSTOMER_ID     = ""
 EXT_CUSTOMER_ID = ""
 LOGIN_URL       = ""
 DASHBOARD_URL   = ""
-EXCHANGE_URL    = ""
 EXPORT_ACTION   = ""
 COOKIE_FILE: Path = Path.home() / ".backupify_session.json"
-USERS_FILE:  Path = Path.home() / ".backupify_users_.json"
 
 
 def apply_config(cfg: dict) -> None:
     """Overwrite module-level runtime globals from the loaded config dict."""
     global BASE_URL, CUSTOMER_ID, EXT_CUSTOMER_ID, LOGIN_URL
-    global DASHBOARD_URL, EXCHANGE_URL, EXPORT_ACTION, COOKIE_FILE, USERS_FILE
+    global DASHBOARD_URL, EXPORT_ACTION, COOKIE_FILE
 
     s = cfg["server"]
     a = cfg["account"]
@@ -162,16 +201,42 @@ def apply_config(cfg: dict) -> None:
     EXT_CUSTOMER_ID = s.get("ext_customer_id", "")
     LOGIN_URL       = f"https://auth.datto.com/login?login_hint={a.get('email', '')}"
     DASHBOARD_URL   = f"{BASE_URL}/{CUSTOMER_ID}/o365?external_customer_id={EXT_CUSTOMER_ID}"
-    EXCHANGE_URL    = f"{BASE_URL}/{CUSTOMER_ID}/o365/exchange"
     EXPORT_ACTION   = f"{BASE_URL}/{CUSTOMER_ID}/restoreExportAction"
     COOKIE_FILE     = Path.home() / ".backupify_session.json"
-    USERS_FILE      = Path.home() / f".backupify_users_{CUSTOMER_ID}.json"
+
+
+def section_url(svc: ServiceDef) -> str:
+    return f"{BASE_URL}/{CUSTOMER_ID}/o365/{svc.section}"
+
+
+def export_page_url(svc: ServiceDef) -> str:
+    return f"{BASE_URL}/{CUSTOMER_ID}/o365/{svc.section}/export"
+
+
+def service_page_url(svc: ServiceDef, service_id: str) -> str:
+    return f"{BASE_URL}/{CUSTOMER_ID}/o365/{svc.section}/service?serviceId={service_id}"
+
+
+def entity_cache_path(svc: ServiceDef) -> Path:
+    # Exchange keeps its pre-refactor cache filename so existing caches survive
+    if svc.key == "exchange":
+        return Path.home() / f".backupify_users_{CUSTOMER_ID}.json"
+    return Path.home() / f".backupify_{svc.key}_{CUSTOMER_ID}.json"
 
 
 # ─── Poll / download tunables ─────────────────────────────────────────────────
 
 POLL_INTERVAL    = 30           # seconds between export-status scans
 EXPORT_TIMEOUT   = 10_800       # max wait for one export job (3 h)
+
+# How many consecutive scans a job may be absent from the export page before
+# it's declared missing.  Under heavy load the server can take 45+ minutes to
+# even list a freshly triggered job (an 8 MB OneDrive export once took 46 min
+# end-to-end), so fresh triggers get a long leash; a resumed job id from an
+# earlier session that stays absent is most likely genuinely gone, but still
+# gets enough scans to ride out a slow page before we re-trigger.
+MISSING_FRESH_SCANS   = 120     # fresh trigger:  ~60 min at POLL_INTERVAL=30s
+MISSING_RESUMED_SCANS = 20      # resumed job id: ~10 min, then re-trigger
 DOWNLOAD_TIMEOUT = 7_200        # max read time for one download (2 h)
 CHUNK_SIZE       = 16 * 1024 * 1024
 
@@ -418,32 +483,36 @@ async def extract_cookies(context: BrowserContext) -> dict:
     return cookies
 
 
-# ─── User discovery ───────────────────────────────────────────────────────────
+# ─── Entity discovery ─────────────────────────────────────────────────────────
 
-async def get_all_users(
+async def get_entities(
     context: BrowserContext,
     cookies: dict,
+    svc: ServiceDef,
     logger: logging.Logger,
 ) -> list[dict]:
     """
-    Returns the full Exchange user list.  Loads from USERS_FILE cache on
-    subsequent runs; delete the file (or press F5 in the TUI) to re-fetch.
+    Returns the full entity list for one service (Exchange users, OneDrive
+    drives, …).  Loads from the per-service cache file on subsequent runs;
+    delete the file (or press F5 in the TUI) to re-fetch.
 
-    Returns [{"service_id", "name", "email", "snapshot_id"}, ...].
+    Returns [{"service_id", "name", "email", "snapshot_id",
+              "size_bytes", "size_label"}, ...].
     """
-    if USERS_FILE.exists():
+    cache_file = entity_cache_path(svc)
+    if cache_file.exists():
         try:
-            users = json.loads(USERS_FILE.read_text(encoding="utf-8"))
+            users = json.loads(cache_file.read_text(encoding="utf-8"))
             if users:
                 for u in users:  # older caches stored HTML entities (&#039; etc.)
                     u["name"]  = html.unescape(u.get("name")  or "")
                     u["email"] = html.unescape(u.get("email") or "")
-                logger.info(f"Loaded {len(users)} users from cache ({USERS_FILE}).")
+                logger.info(f"Loaded {len(users)} {svc.key} entities from cache ({cache_file}).")
                 return users
         except Exception as e:
-            logger.warning(f"Could not read user cache: {e} — re-fetching.")
+            logger.warning(f"Could not read {svc.key} entity cache: {e} — re-fetching.")
 
-    logger.info("Loading Exchange user list via customerServices XHR...")
+    logger.info(f"Loading {svc.key} entity list via customerServices XHR...")
     page = await context.new_page()
 
     captured_req: dict = {}
@@ -465,7 +534,7 @@ async def get_all_users(
             lambda r: "/customerServices" in r.url and r.status == 200,
             timeout=45_000,
         ) as resp_info:
-            await page.goto(EXCHANGE_URL, wait_until="domcontentloaded")
+            await page.goto(section_url(svc), wait_until="domcontentloaded")
 
         first_data    = await (await resp_info.value).json()
         records_total = first_data.get("recordsTotal", 0)
@@ -525,14 +594,16 @@ async def get_all_users(
             "name":        name or service_id,
             "email":       email,
             "snapshot_id": snapshot_id,
+            "size_bytes":  row.get("ownSize"),
+            "size_label":  row.get("usedBytes") or "",
         })
 
     if not users:
-        raise RuntimeError("No users extracted from customerServices response.")
+        raise RuntimeError("No entities extracted from customerServices response.")
 
-    logger.info(f"Found {len(users)} Exchange users.")
-    USERS_FILE.write_text(json.dumps(users, indent=2), encoding="utf-8")
-    logger.info(f"User list cached to {USERS_FILE}.")
+    logger.info(f"Found {len(users)} {svc.key} entities.")
+    cache_file.write_text(json.dumps(users, indent=2), encoding="utf-8")
+    logger.info(f"Entity list cached to {cache_file}.")
     return users
 
 
@@ -540,10 +611,11 @@ async def get_all_users(
 
 async def get_latest_snapshot_id(
     context: BrowserContext,
+    svc: ServiceDef,
     service_id: str,
     logger: logging.Logger,
 ) -> str | None:
-    service_url = f"{BASE_URL}/{CUSTOMER_ID}/o365/exchange/service?serviceId={service_id}"
+    service_url = service_page_url(svc, service_id)
     page = await context.new_page()
     try:
         await page.goto(service_url, wait_until="domcontentloaded")
@@ -598,20 +670,22 @@ async def get_latest_snapshot_id(
 async def trigger_export(
     context: BrowserContext,
     cookies: dict,
+    svc: ServiceDef,
     service_id: str,
     snapshot_id: str,
     logger: logging.Logger,
 ) -> str | None:
     payload = {
         "actionType":         "export",
-        "appType":            "office365_exchange",
+        "appType":            svc.app_type,
         "snapshotId":         snapshot_id,
         "token":              "",
-        "exportFormat":       "pst",
         "includePermissions": "false",
         "includeAttachments": "false",
         "services[]":         service_id,
     }
+    if svc.export_format:
+        payload["exportFormat"] = svc.export_format
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
     async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
         resp = await client.post(
@@ -619,7 +693,7 @@ async def trigger_export(
             data=payload,
             headers={
                 "Cookie":           cookie_header,
-                "Referer":          f"{BASE_URL}/{CUSTOMER_ID}/o365/exchange/service?serviceId={service_id}",
+                "Referer":          service_page_url(svc, service_id),
                 "User-Agent":       "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
                 "X-Requested-With": "XMLHttpRequest",
                 "Accept":           "application/json, text/javascript, */*",
@@ -639,25 +713,36 @@ async def trigger_export(
 
 
 # ─── Export polling ───────────────────────────────────────────────────────────
+#
+# One status cache per service — each service has its own export page, and
+# job ids are only guaranteed unique within one.
 
-_export_cache:      dict  = {}
-_export_cache_time: float = 0.0
-_export_scan_lock: asyncio.Lock | None = None
+_export_caches:      dict[str, dict]  = {key: {} for key in SERVICES}
+_export_cache_times: dict[str, float] = {key: 0.0 for key in SERVICES}
+_export_scan_locks:  dict[str, asyncio.Lock | None] = {key: None for key in SERVICES}
+# Rows still queued/running carry NO action links on some services (SharePoint:
+# no ?id= href until the job completes), so they can't go in the id-keyed cache.
+# Kept per scan so the poll can match them by source name instead.
+_export_pending:     dict[str, list]  = {key: [] for key in SERVICES}
 
 
-async def scan_export_page(context: BrowserContext, logger: logging.Logger) -> list[dict]:
+async def scan_export_page(
+    context: BrowserContext,
+    svc: ServiceDef,
+    logger: logging.Logger,
+) -> list[dict]:
     """
-    Navigates to the export page and parses all server-rendered DataTable rows,
-    paginating as needed.
+    Navigates to the service's export page and parses all server-rendered
+    DataTable rows, paginating as needed.  Exchange and OneDrive share the
+    same #exportListItems layout (status col 7, action links col 8).
 
     Each record: {"job_id", "source_name", "status", "download_url"}.
     """
-    export_page_url = f"{BASE_URL}/{CUSTOMER_ID}/o365/exchange/export"
     page = await context.new_page()
     records: list[dict] = []
 
     try:
-        await page.goto(export_page_url, wait_until="domcontentloaded", timeout=PAGE_LOAD_MS)
+        await page.goto(export_page_url(svc), wait_until="domcontentloaded", timeout=PAGE_LOAD_MS)
         try:
             await page.wait_for_selector("#exportListItems tbody tr", timeout=ELEMENT_MS)
         except PWTimeout:
@@ -731,23 +816,60 @@ async def scan_export_page(context: BrowserContext, logger: logging.Logger) -> l
     return records
 
 
-async def refresh_export_cache(context: BrowserContext, logger: logging.Logger) -> None:
-    """Scans the export page once and updates the shared status cache."""
-    global _export_cache, _export_cache_time
-    records = await scan_export_page(context, logger)
+async def refresh_export_cache(
+    context: BrowserContext,
+    svc: ServiceDef,
+    logger: logging.Logger,
+) -> None:
+    """Scans the service's export page once and updates its status cache."""
+    records = await scan_export_page(context, svc, logger)
+    pending = []
     for rec in records:
         if rec["job_id"]:
-            _export_cache[rec["job_id"]] = rec
-    _export_cache_time = time.monotonic()
+            _export_caches[svc.key][rec["job_id"]] = rec
+        elif rec["status"] not in ("completed", "failed", "error", "cancelled"):
+            pending.append(rec)
+    _export_pending[svc.key] = pending
+    _export_cache_times[svc.key] = time.monotonic()
+
+
+def find_server_export(svc: ServiceDef, source_name: str) -> dict | None:
+    """
+    Checks the last export-page scan for an export of this entity that some
+    earlier run (or another machine) already started, so we don't trigger a
+    duplicate.  Preference order:
+      1. completed with a live download link  → caller can skip straight to it
+      2. a row with an id and non-terminal status → adopt and poll by id
+      3. an id-less queued/running row ("In Progress", no links yet) → adopt
+         by name (poll with job_id=None)
+    Expired exports (completed, no link) don't count.  Caller must ensure the
+    name is unambiguous — the export page identifies rows by source name only.
+    """
+    records = [r for r in _export_caches[svc.key].values()
+               if r["source_name"] == source_name]
+    completed = [r for r in records if r["status"] == "completed" and r["download_url"]]
+    if completed:
+        return max(completed, key=lambda r: int(r["job_id"]))
+    running = [r for r in records
+               if r["status"] not in ("completed", "failed", "error", "cancelled")]
+    if running:
+        return max(running, key=lambda r: int(r["job_id"]))
+    for r in _export_pending[svc.key]:
+        if r["source_name"] == source_name:
+            return r            # job_id is None — adopt by name
+    return None
 
 
 async def poll_for_download_url(
     context: BrowserContext,
-    job_id: str,
+    svc: ServiceDef,
+    job_id: str | None,
     service_id: str,
     logger: logging.Logger,
     on_status=None,
-    max_unseen: int = 4,
+    max_unseen: int = MISSING_RESUMED_SCANS,
+    source_name: str | None = None,
+    should_defer=None,
 ) -> tuple[str, str | None]:
     """
     Waits until the export job is completed and returns (outcome, url):
@@ -755,56 +877,87 @@ async def poll_for_download_url(
       ("missing", None) — job absent from the export page for max_unseen scans
       ("failed", None)  — job ended in failed/error/cancelled
       ("timeout", None) — EXPORT_TIMEOUT exceeded
+      ("deferred", None)— should_defer() returned True (wind-down); the job is
+                          left running server-side for a later session to resume
 
-    All concurrent workers share one page-scan via _export_scan_lock.
+    All concurrent workers of one service share one page-scan via its lock.
     on_status: optional callable(str) for live UI updates each poll.
+    source_name: the entity's display name as it appears in the export table's
+    Source column.  Queued/running rows carry no job id on some services, so a
+    name match there means the job is alive — it doesn't count as unseen.
     """
-    global _export_cache_time
+    cache      = _export_caches[svc.key]
+    scan_lock  = _export_scan_locks[svc.key]
+    job_label  = job_id or f"unlisted export of '{source_name}'"
+
+    # job_id None = adopting an id-less in-flight export found on the page:
+    # completion is detected as the first NEW completed row with our name.
+    known_ids = (
+        {jid for jid, rec in cache.items() if rec["source_name"] == source_name}
+        if job_id is None else set()
+    )
 
     start          = time.monotonic()
     deadline       = start + EXPORT_TIMEOUT
     unseen_scans   = 0
-    last_scan_time = _export_cache_time
+    last_scan_time = _export_cache_times[svc.key]
 
     while time.monotonic() < deadline:
-        cache_age = time.monotonic() - _export_cache_time
+        if should_defer and should_defer():
+            logger.info(f"[{service_id}] Poll deferred (wind-down) — {job_label} left running.")
+            return ("deferred", None)
+        cache_age = time.monotonic() - _export_cache_times[svc.key]
         if cache_age >= POLL_INTERVAL:
-            async with _export_scan_lock:
-                if time.monotonic() - _export_cache_time >= POLL_INTERVAL:
+            async with scan_lock:
+                if time.monotonic() - _export_cache_times[svc.key] >= POLL_INTERVAL:
                     try:
-                        await refresh_export_cache(context, logger)
+                        await refresh_export_cache(context, svc, logger)
                     except Exception as e:
                         # A flaky scan must not kill the worker — back off
                         # until the next interval and try again.
                         logger.warning(f"Export scan failed (will retry): {e}")
-                        _export_cache_time = time.monotonic()
+                        _export_cache_times[svc.key] = time.monotonic()
 
-        record  = _export_cache.get(str(job_id))
+        if job_id is None:
+            fresh  = [rec for jid, rec in cache.items()
+                      if rec["source_name"] == source_name and jid not in known_ids]
+            record = max(fresh, key=lambda r: int(r["job_id"])) if fresh else None
+        else:
+            record = cache.get(str(job_id))
         elapsed = int(time.monotonic() - start)
 
         if record:
             unseen_scans = 0
             status = record["status"]
             if on_status:
-                on_status(f"job {job_id}: {status} · {elapsed // 60}m {elapsed % 60:02d}s")
+                on_status(f"job {job_label}: {status} · {elapsed // 60}m {elapsed % 60:02d}s")
             if status == "completed":
                 url = record["download_url"]
                 if url:
                     logger.info(f"[{service_id}] Export ready after {elapsed}s.")
                     return ("ok", url)
             elif status in ("failed", "error", "cancelled"):
-                logger.error(f"[{service_id}] Export job {job_id} ended: {status}")
+                logger.error(f"[{service_id}] Export job {job_label} ended: {status}")
                 return ("failed", None)
+        elif source_name and any(
+            r["source_name"] == source_name for r in _export_pending[svc.key]
+        ):
+            # The job has no id-bearing links yet, but a queued/running row
+            # with our name is on the export page — it's alive, keep waiting.
+            unseen_scans   = 0
+            last_scan_time = _export_cache_times[svc.key]
+            if on_status:
+                on_status(f"job {job_label}: queued · {elapsed // 60}m {elapsed % 60:02d}s")
         else:
             # Count scans that completed while the job was still absent
-            if _export_cache_time != last_scan_time:
+            if _export_cache_times[svc.key] != last_scan_time:
                 unseen_scans  += 1
-                last_scan_time = _export_cache_time
+                last_scan_time = _export_cache_times[svc.key]
             if on_status:
-                on_status(f"job {job_id}: not listed yet (scan {unseen_scans}/{max_unseen})")
+                on_status(f"job {job_label}: not listed yet (scan {unseen_scans}/{max_unseen})")
             if unseen_scans >= max_unseen:
                 logger.warning(
-                    f"[{service_id}] Job {job_id} absent after {unseen_scans} scans — treating as stale."
+                    f"[{service_id}] Job {job_label} absent after {unseen_scans} scans — treating as stale."
                 )
                 return ("missing", None)
 
@@ -816,10 +969,27 @@ async def poll_for_download_url(
 
 # ─── File download ────────────────────────────────────────────────────────────
 
-def pst_path(output_dir: Path, user_name: str, service_id: str) -> Path:
-    """Canonical on-disk path for a mailbox export (server sends raw PST)."""
-    safe_name = re.sub(r'[<>:"/\\|?*\s]', "_", user_name).strip("_")
-    return output_dir / f"{safe_name}__{service_id}.pst"
+def _safe_name(user_name: str) -> str:
+    return re.sub(r'[<>:"/\\|?*\s]', "_", user_name).strip("_")
+
+
+def export_file_path(output_dir: Path, user_name: str, service_id: str, ext: str) -> Path:
+    """Canonical on-disk path for one entity's export."""
+    return output_dir / f"{_safe_name(user_name)}__{service_id}{ext}"
+
+
+def find_existing_export(output_dir: Path, user_name: str, service_id: str) -> Path | None:
+    """
+    Finds a previously downloaded export for this entity regardless of
+    extension (the server's Content-Disposition decides it at download time).
+    """
+    prefix = f"{_safe_name(user_name)}__{service_id}."
+    if not output_dir.is_dir():
+        return None
+    for p in output_dir.iterdir():
+        if p.name.startswith(prefix) and not p.name.endswith(".part"):
+            return p
+    return None
 
 
 async def download_file(
@@ -828,6 +998,7 @@ async def download_file(
     output_dir: Path,
     user_name: str,
     service_id: str,
+    svc: ServiceDef,
     logger: logging.Logger,
     on_progress=None,
 ) -> str | None:
@@ -835,19 +1006,17 @@ async def download_file(
         download_url = BASE_URL + download_url
 
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
-    filename      = pst_path(output_dir, user_name, service_id)
-    part_file     = filename.with_name(filename.name + ".part")
 
-    if filename.exists():
-        size_mb = filename.stat().st_size / 1_048_576
+    existing = find_existing_export(output_dir, user_name, service_id)
+    if existing:
+        size_mb = existing.stat().st_size / 1_048_576
         logger.info(f"[{service_id}] File already exists ({size_mb:.1f} MB), skipping.")
-        return filename.name
+        return existing.name
 
+    part_file = export_file_path(output_dir, user_name, service_id, ".part")
     if part_file.exists():
         logger.info(f"[{service_id}] Removing stale partial file {part_file.name}")
         part_file.unlink()
-
-    logger.info(f"[{service_id}] Downloading → {filename.name}")
 
     try:
         async with httpx.AsyncClient(
@@ -866,6 +1035,20 @@ async def download_file(
                     logger.error(f"[{service_id}] Download HTTP {resp.status_code}")
                     return None
 
+                # The server's filename (if any) decides the real extension;
+                # fall back to the service default.
+                ext = svc.file_ext
+                disposition = resp.headers.get("content-disposition", "")
+                m = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', disposition)
+                if m:
+                    suffix = Path(m.group(1).strip()).suffix
+                    if suffix:
+                        ext = suffix
+                logger.info(
+                    f"[{service_id}] Downloading (content-type "
+                    f"{resp.headers.get('content-type', '?')}, ext {ext})"
+                )
+
                 total      = int(resp.headers.get("content-length", 0))
                 downloaded = 0
 
@@ -876,6 +1059,7 @@ async def download_file(
                         if on_progress:
                             on_progress(downloaded, total)
 
+        filename = export_file_path(output_dir, user_name, service_id, ext)
         part_file.rename(filename)
         size_mb = filename.stat().st_size / 1_048_576
         logger.info(f"[{service_id}] Saved {filename.name} ({size_mb:.1f} MB)")
@@ -891,10 +1075,10 @@ async def download_file(
 # ─── TUI — sort helpers ───────────────────────────────────────────────────────
 
 _SORT_OPTIONS = [
-    ("Alphabetical (A → Z)",   "az"),
-    ("Alphabetical (Z → A)",   "za"),
-    ("Largest mailbox first",  "size_desc"),
-    ("Smallest mailbox first", "size_asc"),
+    ("Alphabetical (A → Z)", "az"),
+    ("Alphabetical (Z → A)", "za"),
+    ("Largest first",        "size_desc"),
+    ("Smallest first",       "size_asc"),
 ]
 
 _STATUS_ICONS = {
@@ -906,7 +1090,18 @@ _STATUS_ICONS = {
     "complete":    "✓",
     "failed":      "✗",
     "skipped":     "—",
+    "deferred":    "⏸",
 }
+
+
+def _size_sort_key(u: dict) -> int:
+    # Real byte size when the entity cache has it; pre-refactor Exchange
+    # caches lack it, so fall back to the old snapshot_id (epoch-ms) proxy
+    # until the user refreshes the list (F5).
+    size = u.get("size_bytes")
+    if size is not None:
+        return int(size)
+    return int(u.get("snapshot_id") or 0)
 
 
 def _sort_users(users: list[dict], key: str) -> list[dict]:
@@ -914,51 +1109,62 @@ def _sort_users(users: list[dict], key: str) -> list[dict]:
         return sorted(users, key=lambda u: u["name"].lower())
     if key == "za":
         return sorted(users, key=lambda u: u["name"].lower(), reverse=True)
-    # snapshot_id is epoch-ms — used as a size proxy until real size data is
-    # extracted (see ROADMAP.md: "Actual size-based sorting")
     if key == "size_desc":
-        return sorted(users, key=lambda u: int(u.get("snapshot_id") or 0), reverse=True)
+        return sorted(users, key=_size_sort_key, reverse=True)
     if key == "size_asc":
-        return sorted(users, key=lambda u: int(u.get("snapshot_id") or 0))
+        return sorted(users, key=_size_sort_key)
     return users
 
 
 # ─── TUI — messages ───────────────────────────────────────────────────────────
+# `service` is a SERVICES key; None on StatusUpdate/LogEntry = broadcast to
+# every tab (session-level events).
 
 class SessionReady(Message):
     pass
 
 
 class StatusUpdate(Message):
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, service: str | None = None) -> None:
         super().__init__()
-        self.text = text
+        self.text    = text
+        self.service = service
 
 
 class UsersLoaded(Message):
-    def __init__(self, users: list[dict]) -> None:
+    def __init__(self, service: str, users: list[dict]) -> None:
         super().__init__()
-        self.users = users
+        self.service = service
+        self.users   = users
+
+
+class UsersLoadFailed(Message):
+    def __init__(self, service: str) -> None:
+        super().__init__()
+        self.service = service
 
 
 class LogEntry(Message):
-    def __init__(self, level: str, text: str) -> None:
+    def __init__(self, level: str, text: str, service: str | None = None) -> None:
         super().__init__()
-        self.level = level
-        self.text  = text
+        self.level   = level
+        self.text    = text
+        self.service = service
 
 
 class ExportUpdate(Message):
-    def __init__(self, service_id: str, status: str, detail: str = "") -> None:
+    def __init__(self, service: str, service_id: str, status: str, detail: str = "") -> None:
         super().__init__()
+        self.service    = service
         self.service_id = service_id
         self.status     = status
         self.detail     = detail
 
 
 class DownloadProgress(Message):
-    def __init__(self, service_id: str, done: int, total: int) -> None:
+    def __init__(self, service: str, service_id: str, done: int, total: int) -> None:
         super().__init__()
+        self.service    = service
         self.service_id = service_id
         self.done       = done
         self.total      = total
@@ -1010,8 +1216,8 @@ class OnboardingScreen(Screen):
             with ContentSwitcher(initial="ob-step-0"):
                 with Vertical(id="ob-step-0"):
                     yield Static(
-                        "Welcome! This tool bulk-exports M365 mailboxes (and soon\n"
-                        "OneDrive, SharePoint, and Teams) from Backupify/Datto.\n\n"
+                        "Welcome! This tool bulk-exports M365 mailboxes, OneDrive\n"
+                        "drives, and SharePoint sites from Backupify/Datto.\n\n"
                         "You will need:\n"
                         "  • Your Backupify admin account email\n"
                         "  • The server URL and customer ID from the browser address bar\n\n"
@@ -1168,7 +1374,72 @@ class OnboardingApp(App):
         self.push_screen(OnboardingScreen(self._cfg))
 
 
+# ─── Wind-down modes ──────────────────────────────────────────────────────────
+#
+# App-wide switch for winding work down gracefully (swap drives, shut the
+# machine off, …) without killing anything mid-flight.  Deferred entities
+# keep their progress.json in_progress record, so the next run resumes the
+# same server-side job instead of triggering a new one.
+
+WINDDOWN_MODES: list[tuple[str, str]] = [
+    ("off",              "off — normal operation"),
+    ("no-new-jobs",      "finish in-flight, start nothing new"),
+    ("no-new-downloads", "keep queueing exports, defer downloads"),
+    ("drain",            "finish current downloads only"),
+]
+
+
+class ExtendPollScreen(ModalScreen[bool]):
+    """'Export job still hasn't appeared — keep waiting?' dialog."""
+
+    def __init__(self, entity_name: str, job_id: str, waited_min: int) -> None:
+        super().__init__()
+        self._entity_name = entity_name
+        self._job_id      = job_id
+        self._waited_min  = waited_min
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="extend-dialog"):
+            yield Static("⚠  Export job not listed yet", id="extend-title")
+            yield Static(
+                f"{self._entity_name}: job {self._job_id} has not appeared on the "
+                f"export page after ~{self._waited_min} min.\n\n"
+                "Under heavy load Backupify can take a long time to even list a "
+                "job — it may well still be queued server-side.",
+                id="extend-body",
+            )
+            with Horizontal(id="extend-buttons"):
+                yield Button(f"Keep waiting (+{self._waited_min} min)",
+                             variant="primary", id="extend-wait")
+                yield Button("Give up (mark failed)", variant="error", id="extend-fail")
+
+    @on(Button.Pressed, "#extend-wait")
+    def _handle_extend_wait(self) -> None:
+        self.dismiss(True)
+
+    @on(Button.Pressed, "#extend-fail")
+    def _handle_extend_fail(self) -> None:
+        self.dismiss(False)
+
+
 # ─── TUI — main app ───────────────────────────────────────────────────────────
+
+class TabState:
+    """Per-service UI state — one instance per service tab."""
+
+    def __init__(self, svc: ServiceDef) -> None:
+        self.svc = svc
+        self.users:    list[dict] = []
+        self.filtered: list[dict] = []
+        self.selected: set[str]   = set()
+        self.state: StateManager | None = None
+        self.sort   = "az"
+        self.search = ""
+        self.users_loaded   = False
+        self.users_loading  = False
+        self.export_running = False
+        self.run_pending: set[str] = set()
+
 
 class BackupifyApp(App):
     TITLE = "Backupify Exporter"
@@ -1180,69 +1451,83 @@ class BackupifyApp(App):
     TabbedContent > ContentSwitcher { height: 1fr; }
     TabPane { height: 100%; }
 
-    #exchange-view { height: 100%; layout: vertical; }
+    .service-view { height: 100%; layout: vertical; }
 
-    #settings-bar {
+    .settings-bar {
         height: 3;
         padding: 0 1;
         background: $boost;
         align: left middle;
     }
-    #settings-bar Label { width: auto; padding: 0 1; color: $text-muted; }
-    #output-dir-input  { width: 1fr; }
-    #concurrency-input { width: 6; }
-    #sort-select       { width: 30; }
+    .settings-bar Label { width: auto; padding: 0 1; color: $text-muted; }
+    .output-dir-input  { width: 1fr; }
+    .concurrency-input { width: 6; }
+    .sort-select       { width: 30; }
 
-    #main-panel { height: 1fr; }
+    .main-panel { height: 1fr; }
 
-    #user-panel {
+    .user-panel {
         width: 40%;
         layout: vertical;
         border-right: solid $primary;
     }
-    #search-input { dock: top; }
-    #exchange-user-list { height: 1fr; }
-    #user-stats {
+    .search-input { dock: top; }
+    .user-list { height: 1fr; }
+    .user-stats {
         height: 1;
         padding: 0 1;
         color: $text-muted;
         background: $boost;
     }
-    #user-actions {
+    .user-actions {
         height: 3;
         layout: horizontal;
         background: $boost;
         align: left middle;
         padding: 0 1;
     }
-    #user-actions Button { margin-right: 1; min-width: 8; }
+    .user-actions Button { margin-right: 1; min-width: 8; }
 
-    #export-panel { width: 60%; layout: vertical; }
-    #progress-table { height: 1fr; }
-    #log-pane { height: 10; border-top: solid $primary; }
+    .export-panel { width: 60%; layout: vertical; }
+    .progress-table { height: 1fr; }
+    .log-pane { height: 10; border-top: solid $primary; }
 
-    #control-bar {
+    .control-bar {
         height: 3;
         layout: horizontal;
         background: $boost;
         align: left middle;
         padding: 0 1;
     }
-    #control-bar Button { margin-right: 1; }
-    #status-text { color: $text-muted; content-align: left middle; width: 1fr; height: 3; }
+    .control-bar Button { margin-right: 1; }
+    .status-text { color: $text-muted; content-align: left middle; width: 1fr; height: 3; }
 
     .coming-soon {
         height: 100%;
         content-align: center middle;
         color: $text-muted;
     }
+
+    ExtendPollScreen { align: center middle; }
+    #extend-dialog {
+        width: 64;
+        height: auto;
+        padding: 1 2;
+        background: $surface;
+        border: thick $warning;
+    }
+    #extend-title   { text-style: bold; }
+    #extend-body    { padding: 1 0; }
+    #extend-buttons { height: auto; align: center middle; }
+    #extend-buttons Button { margin: 0 1; }
     """
 
     BINDINGS = [
-        Binding("q",      "quit",          "Quit"),
-        Binding("ctrl+s", "start_export",  "Start"),
-        Binding("f5",     "refresh_users", "Refresh Users"),
-        Binding("ctrl+r", "retry_failed",  "Retry Failed"),
+        Binding("q",      "quit",           "Quit"),
+        Binding("ctrl+s", "start_export",   "Start"),
+        Binding("f5",     "refresh_users",  "Refresh Users"),
+        Binding("ctrl+r", "retry_failed",   "Retry Failed"),
+        Binding("ctrl+w", "cycle_winddown", "Wind-down"),
     ]
 
     def __init__(self, cfg: dict) -> None:
@@ -1252,97 +1537,106 @@ class BackupifyApp(App):
         self._pw_context: BrowserContext | None = None
         self._cookies: dict = {}
 
-        # Exchange tab state — OneDrive/SharePoint/Teams get their own
-        # parallel sets when implemented (different entity types per tab)
-        self._exchange_users:    list[dict] = []
-        self._exchange_filtered: list[dict] = []
-        self._exchange_selected: set[str]   = set()
-        self._exchange_state:    StateManager | None = None
-        self._exchange_sort   = "az"
-        self._exchange_search = ""
+        self._tabs: dict[str, TabState] = {
+            key: TabState(svc) for key, svc in SERVICES.items()
+        }
 
-        self._bfy_logger:    logging.Logger | None = None
-        self._debug_log: logging.Logger | None = None
-        self._semaphore: asyncio.Semaphore | None = None
-        self._export_running = False
-        self._run_pending: set[str] = set()  # service_ids not yet finished this run
+        self._bfy_logger: logging.Logger | None = None
+        self._debug_log:  logging.Logger | None = None
+        self._semaphore:  asyncio.Semaphore | None = None
+
+        self.winddown = "off"                     # see WINDDOWN_MODES
+        self._prompt_lock = asyncio.Lock()        # one missing-job dialog at a time
 
     # ── Layout ────────────────────────────────────────────────────────────
 
     def compose(self) -> ComposeResult:
         yield Header()
         with TabbedContent(initial="tab-exchange"):
-            with TabPane("📧 Exchange", id="tab-exchange"):
-                with Vertical(id="exchange-view"):
-                    with Horizontal(id="settings-bar"):
-                        yield Label("Output:")
-                        yield Input(
-                            value=self._cfg["defaults"]["output_dir"],
-                            placeholder="/path/to/exports",
-                            id="output-dir-input",
-                        )
-                        yield Label("Workers:")
-                        yield Input(
-                            value=str(self._cfg["defaults"]["concurrency"]),
-                            id="concurrency-input",
-                            restrict=r"[0-9]*",
-                        )
-                        yield Label("Sort:")
-                        yield Select(
-                            _SORT_OPTIONS,
-                            value="az",
-                            allow_blank=False,
-                            id="sort-select",
-                        )
-                    with Horizontal(id="main-panel"):
-                        with Vertical(id="user-panel"):
-                            yield Input(placeholder="🔍 Filter users…", id="search-input")
-                            yield SelectionList(id="exchange-user-list")
-                            yield Static("Loading…", id="user-stats")
-                            with Horizontal(id="user-actions"):
-                                yield Button("All",  id="btn-all",  variant="default")
-                                yield Button("None", id="btn-none", variant="default")
-                        with Vertical(id="export-panel"):
-                            yield DataTable(
-                                id="progress-table",
-                                zebra_stripes=True,
-                                cursor_type="row",
-                            )
-                            yield RichLog(id="log-pane", highlight=True, markup=True)
-                    with Horizontal(id="control-bar"):
-                        yield Button("▶ Start",        id="btn-start", variant="success", disabled=True)
-                        yield Button("↺ Retry Failed", id="btn-retry", variant="default")
-                        yield Static("⟳ Starting up…", id="status-text")
-
-            with TabPane("📁 OneDrive", id="tab-onedrive"):
-                yield Static("OneDrive export — coming soon (see ROADMAP.md)", classes="coming-soon")
-            with TabPane("📋 SharePoint", id="tab-sharepoint"):
-                yield Static("SharePoint export — coming soon (see ROADMAP.md)", classes="coming-soon")
+            for key, svc in SERVICES.items():
+                with TabPane(svc.label, id=f"tab-{key}"):
+                    yield from self._compose_service_tab(svc)
             with TabPane("💬 Teams", id="tab-teams"):
                 yield Static("Teams export — coming soon (see ROADMAP.md)", classes="coming-soon")
         yield Footer()
 
+    def _compose_service_tab(self, svc: ServiceDef) -> ComposeResult:
+        k = svc.key
+        with Vertical(classes="service-view"):
+            with Horizontal(classes="settings-bar"):
+                yield Label("Output:")
+                yield Input(
+                    value=self._cfg["defaults"]["output_dir"],
+                    placeholder="/path/to/exports",
+                    id=f"{k}-output-dir-input",
+                    classes="output-dir-input",
+                )
+                yield Label("Workers:")
+                yield Input(
+                    value=str(self._cfg["defaults"]["concurrency"]),
+                    id=f"{k}-concurrency-input",
+                    classes="concurrency-input",
+                    restrict=r"[0-9]*",
+                )
+                yield Label("Sort:")
+                yield Select(
+                    _SORT_OPTIONS,
+                    value="az",
+                    allow_blank=False,
+                    id=f"{k}-sort-select",
+                    classes="sort-select",
+                )
+            with Horizontal(classes="main-panel"):
+                with Vertical(classes="user-panel"):
+                    yield Input(
+                        placeholder=f"🔍 Filter {svc.noun_plural}…",
+                        id=f"{k}-search-input",
+                        classes="search-input",
+                    )
+                    yield SelectionList(id=f"{k}-user-list", classes="user-list")
+                    yield Static("Loading…", id=f"{k}-user-stats", classes="user-stats")
+                    with Horizontal(classes="user-actions"):
+                        yield Button("All",  id=f"{k}-btn-all",  classes="btn-all",  variant="default")
+                        yield Button("None", id=f"{k}-btn-none", classes="btn-none", variant="default")
+                with Vertical(classes="export-panel"):
+                    yield DataTable(
+                        id=f"{k}-progress-table",
+                        classes="progress-table",
+                        zebra_stripes=True,
+                        cursor_type="row",
+                    )
+                    yield RichLog(id=f"{k}-log-pane", classes="log-pane", highlight=True, markup=True)
+            with Horizontal(classes="control-bar"):
+                yield Button("▶ Start", id=f"{k}-btn-start", classes="btn-start",
+                             variant="success", disabled=True)
+                yield Button("↺ Retry Failed", id=f"{k}-btn-retry", classes="btn-retry",
+                             variant="default")
+                yield Static("⟳ Starting up…", id=f"{k}-status-text", classes="status-text")
+
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     def on_mount(self) -> None:
-        global _export_scan_lock
         apply_config(self._cfg)
 
-        exchange_dir = Path(self._cfg["defaults"]["output_dir"]) / "exchange"
-        exchange_dir.mkdir(parents=True, exist_ok=True)
+        output_root = Path(self._cfg["defaults"]["output_dir"])
+        output_root.mkdir(parents=True, exist_ok=True)
 
-        self._exchange_state = StateManager(exchange_dir)
-        self._bfy_logger         = setup_logging(exchange_dir)
-        self._debug_log      = setup_playwright_debug_logging()
-        self._semaphore      = asyncio.Semaphore(int(self._cfg["defaults"]["concurrency"]))
-        _export_scan_lock    = asyncio.Lock()
+        self._bfy_logger = setup_logging(output_root)
+        self._debug_log  = setup_playwright_debug_logging()
+        self._semaphore  = asyncio.Semaphore(int(self._cfg["defaults"]["concurrency"]))
 
-        table = self.query_one("#progress-table", DataTable)
-        table.add_column("Name",     key="name",   width=28)
-        table.add_column("Status",   key="status", width=15)
-        table.add_column("Progress", key="detail", width=40)
+        for key, tab in self._tabs.items():
+            service_dir = output_root / key
+            service_dir.mkdir(parents=True, exist_ok=True)
+            tab.state = StateManager(service_dir)
+            _export_scan_locks[key] = asyncio.Lock()
 
-        # Spinner over the user list until UsersLoaded arrives
+            table = self.query_one(f"#{key}-progress-table", DataTable)
+            table.add_column("Name",     key="name",   width=28)
+            table.add_column("Status",   key="status", width=15)
+            table.add_column("Progress", key="detail", width=40)
+
+        # Spinner over the initial tab's list until UsersLoaded arrives
         self.query_one("#exchange-user-list", SelectionList).loading = True
 
         self.init_session()
@@ -1362,163 +1656,279 @@ class BackupifyApp(App):
             self._pw_context = context
             self._cookies = await extract_cookies(context)
             self.post_message(SessionReady())
-            self.post_message(StatusUpdate("⟳ Session ready — loading user list…"))
-            self.post_message(LogEntry("info", "Session ready — loading users…"))
-            self.load_users()
+            self.post_message(StatusUpdate("⟳ Session ready — loading entity list…"))
+            self.post_message(LogEntry("info", "Session ready — loading entities…"))
+            active = self._active_service_key() or "exchange"
+            self._request_users_load(active)
         except Exception as exc:
             self.post_message(StatusUpdate("✗ Session failed — see log pane"))
             self.post_message(LogEntry("error", f"Session error: {exc}"))
-            self.query_one("#exchange-user-list", SelectionList).loading = False
+            for key in self._tabs:
+                self.query_one(f"#{key}-user-list", SelectionList).loading = False
 
-    @work(exclusive=True, group="users")
-    async def load_users(self) -> None:
+    def _request_users_load(self, key: str) -> None:
+        """Loads a tab's entity list once, the first time it's needed."""
+        tab = self._tabs[key]
+        if not self._pw_context or tab.users_loaded or tab.users_loading:
+            return
+        tab.users_loading = True
+        self.query_one(f"#{key}-user-list", SelectionList).loading = True
+        self.load_users(key)
+
+    @work(group="users")
+    async def load_users(self, key: str) -> None:
+        tab = self._tabs[key]
         try:
-            users = await get_all_users(self._pw_context, self._cookies, self._bfy_logger)
-            self.post_message(UsersLoaded(users))
+            users = await get_entities(
+                self._pw_context, self._cookies, tab.svc, self._bfy_logger
+            )
+            self.post_message(UsersLoaded(key, users))
         except Exception as exc:
-            self.post_message(LogEntry("error", f"User load failed: {exc}"))
+            self.post_message(LogEntry("error", f"Entity load failed: {exc}", service=key))
+            self.post_message(UsersLoadFailed(key))
 
     @work(group="preflight")
-    async def run_preflight(self, users: list[dict], output_dir: Path) -> None:
-        self.post_message(LogEntry("info", "Scanning existing export jobs…"))
+    async def run_preflight(self, key: str, users: list[dict], output_dir: Path) -> None:
+        tab = self._tabs[key]
+        self.post_message(LogEntry("info", "Scanning existing export jobs…", service=key))
         try:
-            await refresh_export_cache(self._pw_context, self._bfy_logger)
-            self.post_message(LogEntry("info", f"Found {len(_export_cache)} existing job(s)."))
+            await refresh_export_cache(self._pw_context, tab.svc, self._bfy_logger)
+            self.post_message(LogEntry(
+                "info", f"Found {len(_export_caches[key])} existing job(s).", service=key
+            ))
         except Exception as exc:
-            self.post_message(LogEntry("warning", f"Export scan failed: {exc}"))
+            self.post_message(LogEntry("warning", f"Export scan failed: {exc}", service=key))
 
         for user in users:
             sid = user["service_id"]
-            if self._exchange_state.is_done(sid):
-                self.post_message(ExportUpdate(sid, "skipped", "already complete"))
+            if tab.state.is_done(sid):
+                self.post_message(ExportUpdate(key, sid, "skipped", "already complete"))
             else:
-                self.export_one_user(user, output_dir)
+                self.export_one_user(key, user, output_dir)
 
     @work(group="exports")
-    async def export_one_user(self, user: dict, output_dir: Path) -> None:
-        sid  = user["service_id"]
-        name = user.get("name") or sid
+    async def export_one_user(self, key: str, user: dict, output_dir: Path) -> None:
+        tab   = self._tabs[key]
+        svc   = tab.svc
+        state = tab.state
+        sid   = user["service_id"]
+        name  = user.get("name") or sid
 
         # Already on disk (e.g. downloaded by an earlier version) — don't
         # trigger a fresh server-side export for it.
-        existing_file = pst_path(output_dir, name, sid)
-        if existing_file.exists():
-            self._exchange_state.mark_complete(sid, existing_file.name)
-            self.post_message(ExportUpdate(sid, "skipped", "already on disk"))
+        existing_file = find_existing_export(output_dir, name, sid)
+        if existing_file:
+            state.mark_complete(sid, existing_file.name)
+            self.post_message(ExportUpdate(key, sid, "skipped", "already on disk"))
+            return
+
+        if self.winddown in ("no-new-jobs", "drain"):
+            self.post_message(ExportUpdate(key, sid, "deferred", "wind-down — not started"))
             return
 
         async with self._semaphore:
+            # Mode may have flipped while this worker queued on the semaphore
+            if self.winddown in ("no-new-jobs", "drain"):
+                self.post_message(ExportUpdate(key, sid, "deferred", "wind-down — not started"))
+                return
             try:
                 snapshot_id = user.get("snapshot_id") or await get_latest_snapshot_id(
-                    self._pw_context, sid, self._bfy_logger
+                    self._pw_context, svc, sid, self._bfy_logger
                 )
                 if not snapshot_id:
-                    self._exchange_state.mark_failed(sid, "No snapshot ID")
-                    self.post_message(ExportUpdate(sid, "failed", "no snapshot"))
+                    state.mark_failed(sid, "No snapshot ID")
+                    self.post_message(ExportUpdate(key, sid, "failed", "no snapshot"))
                     return
 
-                existing = self._exchange_state.get_in_progress(sid)
+                existing = state.get_in_progress(sid)
                 resumed  = bool(existing)
+                adopted: dict | None = None
                 if existing:
                     job_id = existing["job_id"]
-                    self.post_message(ExportUpdate(sid, "resuming", f"job {job_id}"))
+                    self.post_message(ExportUpdate(key, sid, "resuming", f"job {job_id}"))
                 else:
-                    self.post_message(ExportUpdate(sid, "triggering"))
-                    job_id = await trigger_export(
-                        self._pw_context, self._cookies, sid, snapshot_id, self._bfy_logger
-                    )
-                    if not job_id:
-                        self._exchange_state.mark_failed(sid, "Trigger failed")
-                        self.post_message(ExportUpdate(sid, "failed", "trigger failed"))
-                        return
-                    self._exchange_state.mark_in_progress(sid, job_id, snapshot_id)
+                    # An earlier run (or another machine) may already have an
+                    # export of this entity on the server — adopt it instead of
+                    # triggering a duplicate.  Only safe when the name is
+                    # unique: the export page identifies rows by name alone.
+                    if sum(1 for u in tab.users if u.get("name") == name) == 1:
+                        adopted = find_server_export(svc, name)
+                    if adopted is not None:
+                        job_id  = adopted.get("job_id")
+                        resumed = True
+                        if job_id:
+                            state.mark_in_progress(sid, job_id, snapshot_id)
+                        self.post_message(ExportUpdate(
+                            key, sid, "resuming",
+                            f"found on server ({adopted['status']})",
+                        ))
+                        self.post_message(LogEntry(
+                            "info",
+                            f"{name}: export already on server "
+                            f"({adopted['status']}, job {job_id or 'unlisted'}) — adopting it.",
+                            service=key,
+                        ))
+                    else:
+                        self.post_message(ExportUpdate(key, sid, "triggering"))
+                        job_id = await trigger_export(
+                            self._pw_context, self._cookies, svc, sid, snapshot_id, self._bfy_logger
+                        )
+                        if not job_id:
+                            state.mark_failed(sid, "Trigger failed")
+                            self.post_message(ExportUpdate(key, sid, "failed", "trigger failed"))
+                            return
+                        state.mark_in_progress(sid, job_id, snapshot_id)
 
                 def _poll_status(text: str) -> None:
-                    self.post_message(ExportUpdate(sid, "polling", text))
+                    self.post_message(ExportUpdate(key, sid, "polling", text))
 
-                self.post_message(ExportUpdate(sid, "polling", f"job {job_id}"))
-                # A resumed job that's absent is stale (4 scans); a freshly
-                # triggered one definitely exists, so wait longer (10 scans)
-                # before giving up on it.
-                outcome, download_url = await poll_for_download_url(
-                    self._pw_context, job_id, sid, self._bfy_logger,
-                    on_status=_poll_status,
-                    max_unseen=4 if resumed else 10,
-                )
+                def _should_defer() -> bool:
+                    return self.winddown == "drain"
+
+                if adopted is not None and adopted["status"] == "completed":
+                    # Server already has the finished export — skip the poll.
+                    outcome, download_url = "ok", adopted["download_url"]
+                else:
+                    self.post_message(ExportUpdate(key, sid, "polling", f"job {job_id or 'unlisted'}"))
+                    # A resumed job that stays absent is stale; a freshly
+                    # triggered one definitely exists, so wait much longer
+                    # before giving up on it.
+                    outcome, download_url = await poll_for_download_url(
+                        self._pw_context, svc, job_id, sid, self._bfy_logger,
+                        on_status=_poll_status,
+                        max_unseen=MISSING_RESUMED_SCANS if resumed else MISSING_FRESH_SCANS,
+                        source_name=name,
+                        should_defer=_should_defer,
+                    )
 
                 if outcome == "missing" and resumed:
                     # Saved job id from an earlier session no longer exists on
                     # the export page — start a fresh export instead.
-                    self.post_message(ExportUpdate(sid, "triggering", "stale job — re-exporting"))
+                    self.post_message(ExportUpdate(key, sid, "triggering", "stale job — re-exporting"))
                     self.post_message(LogEntry(
-                        "warning", f"{name}: saved job {job_id} is gone — re-triggering export."
+                        "warning",
+                        f"{name}: job {job_id or 'unlisted'} is gone — re-triggering export.",
+                        service=key,
                     ))
-                    self._exchange_state.clear_in_progress(sid)
+                    state.clear_in_progress(sid)
                     job_id = await trigger_export(
-                        self._pw_context, self._cookies, sid, snapshot_id, self._bfy_logger
+                        self._pw_context, self._cookies, svc, sid, snapshot_id, self._bfy_logger
                     )
                     if not job_id:
-                        self._exchange_state.mark_failed(sid, "Re-trigger failed")
-                        self.post_message(ExportUpdate(sid, "failed", "re-trigger failed"))
+                        state.mark_failed(sid, "Re-trigger failed")
+                        self.post_message(ExportUpdate(key, sid, "failed", "re-trigger failed"))
                         return
-                    self._exchange_state.mark_in_progress(sid, job_id, snapshot_id)
-                    self.post_message(ExportUpdate(sid, "polling", f"job {job_id}"))
+                    state.mark_in_progress(sid, job_id, snapshot_id)
+                    self.post_message(ExportUpdate(key, sid, "polling", f"job {job_id}"))
                     outcome, download_url = await poll_for_download_url(
-                        self._pw_context, job_id, sid, self._bfy_logger,
+                        self._pw_context, svc, job_id, sid, self._bfy_logger,
                         on_status=_poll_status,
-                        max_unseen=10,
+                        max_unseen=MISSING_FRESH_SCANS,
+                        source_name=name,
+                        should_defer=_should_defer,
                     )
 
-                if not download_url:
-                    self._exchange_state.mark_failed(sid, f"Export {outcome}")
-                    self.post_message(ExportUpdate(sid, "failed", f"export {outcome}"))
+                # A freshly triggered job that's still unlisted is usually the
+                # server lagging under load, not a lost job — ask before failing.
+                while outcome == "missing" and self.winddown != "drain":
+                    self.post_message(ExportUpdate(key, sid, "polling", "missing — awaiting your call"))
+                    if not await self._ask_extend_poll(name, job_id):
+                        break
+                    self.post_message(LogEntry(
+                        "info", f"{name}: extending wait for job {job_id}.", service=key
+                    ))
+                    outcome, download_url = await poll_for_download_url(
+                        self._pw_context, svc, job_id, sid, self._bfy_logger,
+                        on_status=_poll_status,
+                        max_unseen=MISSING_FRESH_SCANS,
+                        source_name=name,
+                        should_defer=_should_defer,
+                    )
+
+                if outcome == "deferred":
+                    # in_progress stays in progress.json → next run resumes it
+                    self.post_message(ExportUpdate(key, sid, "deferred", "wind-down — job left running"))
+                    self.post_message(LogEntry(
+                        "info", f"{name}: poll deferred — job {job_id} resumes next run.", service=key
+                    ))
                     return
 
-                self.post_message(ExportUpdate(sid, "downloading"))
+                if not download_url:
+                    state.mark_failed(sid, f"Export {outcome}")
+                    self.post_message(ExportUpdate(key, sid, "failed", f"export {outcome}"))
+                    return
+
+                if self.winddown in ("no-new-downloads", "drain"):
+                    # in_progress stays → next run resumes the completed job
+                    # and goes straight to the download.
+                    self.post_message(ExportUpdate(key, sid, "deferred", "export ready — download deferred"))
+                    self.post_message(LogEntry(
+                        "info", f"{name}: export ready — download deferred (wind-down).", service=key
+                    ))
+                    return
+
+                self.post_message(ExportUpdate(key, sid, "downloading"))
 
                 def _on_progress(done: int, total: int) -> None:
-                    self.post_message(DownloadProgress(sid, done, total))
+                    self.post_message(DownloadProgress(key, sid, done, total))
 
                 filename = await download_file(
                     download_url, self._cookies, output_dir,
-                    name, sid, self._bfy_logger, on_progress=_on_progress,
+                    name, sid, svc, self._bfy_logger, on_progress=_on_progress,
                 )
                 if filename:
-                    self._exchange_state.mark_complete(sid, filename)
-                    self.post_message(ExportUpdate(sid, "complete", filename[:38]))
-                    self.post_message(LogEntry("success", f"✓ {name}  →  {filename}"))
+                    state.mark_complete(sid, filename)
+                    self.post_message(ExportUpdate(key, sid, "complete", filename[:38]))
+                    self.post_message(LogEntry("success", f"✓ {name}  →  {filename}", service=key))
                 else:
-                    self._exchange_state.mark_failed(sid, "Download failed")
-                    self.post_message(ExportUpdate(sid, "failed", "download error"))
-                    self.post_message(LogEntry("error", f"✗ {name}  download failed"))
+                    state.mark_failed(sid, "Download failed")
+                    self.post_message(ExportUpdate(key, sid, "failed", "download error"))
+                    self.post_message(LogEntry("error", f"✗ {name}  download failed", service=key))
 
             except Exception as exc:
-                self._exchange_state.mark_failed(sid, str(exc))
-                self.post_message(ExportUpdate(sid, "failed", str(exc)[:38]))
-                self.post_message(LogEntry("error", f"✗ {name}: {exc}"))
+                state.mark_failed(sid, str(exc))
+                self.post_message(ExportUpdate(key, sid, "failed", str(exc)[:38]))
+                self.post_message(LogEntry("error", f"✗ {name}: {exc}", service=key))
 
     # ── Worker→UI message handlers ────────────────────────────────────────
 
+    def _set_status(self, text: str, service: str | None) -> None:
+        keys = [service] if service else list(self._tabs)
+        for key in keys:
+            self.query_one(f"#{key}-status-text", Static).update(text)
+
     @on(SessionReady)
     def _handle_session_ready(self) -> None:
-        self.query_one("#status-text", Static).update("⟳ Session active — loading users…")
+        self._set_status("⟳ Session active — loading entities…", None)
 
     @on(StatusUpdate)
     def _handle_status_update(self, event: StatusUpdate) -> None:
-        self.query_one("#status-text", Static).update(event.text)
+        self._set_status(event.text, event.service)
 
     @on(UsersLoaded)
     def _handle_users_loaded(self, event: UsersLoaded) -> None:
-        self._exchange_users    = event.users
-        self._exchange_selected = {u["service_id"] for u in event.users}
-        self.query_one("#exchange-user-list", SelectionList).loading = False
-        self._refresh_user_list()
-        self.query_one("#status-text", Static).update(
-            f"✓ Ready — {len(event.users)} mailboxes loaded. Select users and press Start."
+        tab = self._tabs[event.service]
+        tab.users         = event.users
+        tab.selected      = {u["service_id"] for u in event.users}
+        tab.users_loaded  = True
+        tab.users_loading = False
+        self.query_one(f"#{event.service}-user-list", SelectionList).loading = False
+        self._refresh_user_list(event.service)
+        plural = tab.svc.noun_plural
+        self._set_status(
+            f"✓ Ready — {len(event.users)} {plural} loaded. Select {plural} and press Start.",
+            event.service,
         )
-        if not self._export_running:
-            self.query_one("#btn-start", Button).disabled = False
-        self.notify(f"Ready — {len(event.users)} mailboxes loaded.", title="Backupify")
+        if not tab.export_running:
+            self.query_one(f"#{event.service}-btn-start", Button).disabled = False
+        self.notify(f"Ready — {len(event.users)} {plural} loaded.", title="Backupify")
+
+    @on(UsersLoadFailed)
+    def _handle_users_load_failed(self, event: UsersLoadFailed) -> None:
+        tab = self._tabs[event.service]
+        tab.users_loading = False
+        self.query_one(f"#{event.service}-user-list", SelectionList).loading = False
+        self._set_status("✗ Entity load failed — see log pane", event.service)
 
     @on(LogEntry)
     def _handle_log_entry(self, event: LogEntry) -> None:
@@ -1526,27 +1936,29 @@ class BackupifyApp(App):
             "info": "white", "warning": "yellow",
             "error": "red", "success": "green",
         }.get(event.level, "white")
-        ts = datetime.now().strftime("%H:%M:%S")
-        self.query_one("#log-pane", RichLog).write(
-            f"[{colour}]{ts}  {rich_escape(event.text)}[/{colour}]"
-        )
+        ts   = datetime.now().strftime("%H:%M:%S")
+        line = f"[{colour}]{ts}  {rich_escape(event.text)}[/{colour}]"
+        keys = [event.service] if event.service else list(self._tabs)
+        for key in keys:
+            self.query_one(f"#{key}-log-pane", RichLog).write(line)
 
     @on(ExportUpdate)
     def _handle_export_update(self, event: ExportUpdate) -> None:
+        tab   = self._tabs[event.service]
         icon  = _STATUS_ICONS.get(event.status, "?")
-        table = self.query_one("#progress-table", DataTable)
+        table = self.query_one(f"#{event.service}-progress-table", DataTable)
         try:
             table.update_cell(event.service_id, "status", f"{icon} {event.status.capitalize()}")
             if event.detail:
                 table.update_cell(event.service_id, "detail", event.detail)
         except Exception:
             pass  # row may not exist (e.g. update for a user not in this run)
-        if event.status in ("complete", "failed", "skipped"):
-            self._update_stats()
-            if self._export_running and event.service_id in self._run_pending:
-                self._run_pending.discard(event.service_id)
-                if not self._run_pending:
-                    self._finish_run()
+        if event.status in ("complete", "failed", "skipped", "deferred"):
+            self._update_stats(event.service)
+            if tab.export_running and event.service_id in tab.run_pending:
+                tab.run_pending.discard(event.service_id)
+                if not tab.run_pending:
+                    self._finish_run(event.service)
 
     @on(DownloadProgress)
     def _handle_download_progress(self, event: DownloadProgress) -> None:
@@ -1560,7 +1972,7 @@ class BackupifyApp(App):
         else:
             detail = f"{event.done / 1_048_576:.0f} MB"
         try:
-            self.query_one("#progress-table", DataTable).update_cell(
+            self.query_one(f"#{event.service}-progress-table", DataTable).update_cell(
                 event.service_id, "detail", detail
             )
         except Exception:
@@ -1568,86 +1980,122 @@ class BackupifyApp(App):
 
     # ── UI event handlers ─────────────────────────────────────────────────
 
-    @on(Input.Changed, "#search-input")
-    def _on_search(self, event: Input.Changed) -> None:
-        self._exchange_search = event.value
-        self._refresh_user_list()
+    def _tab_for(self, widget_id: str | None) -> TabState | None:
+        """Maps a per-tab widget id ('onedrive-btn-start') to its TabState."""
+        if not widget_id:
+            return None
+        return self._tabs.get(widget_id.split("-", 1)[0])
 
-    @on(Select.Changed, "#sort-select")
-    def _on_sort(self, event: Select.Changed) -> None:
-        if event.value is not Select.BLANK:
-            self._exchange_sort = str(event.value)
-            self._refresh_user_list()
+    @on(TabbedContent.TabActivated)
+    def _handle_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        key = (event.pane.id or "").removeprefix("tab-")
+        if key in self._tabs:
+            self._request_users_load(key)
 
-    @on(Input.Changed, "#output-dir-input")
-    def _on_output_dir_changed(self, event: Input.Changed) -> None:
+    @on(Input.Changed, ".search-input")
+    def _handle_search(self, event: Input.Changed) -> None:
+        tab = self._tab_for(event.input.id)
+        if tab:
+            tab.search = event.value
+            self._refresh_user_list(tab.svc.key)
+
+    @on(Select.Changed, ".sort-select")
+    def _handle_sort(self, event: Select.Changed) -> None:
+        tab = self._tab_for(event.select.id)
+        if tab and event.value is not Select.BLANK:
+            tab.sort = str(event.value)
+            self._refresh_user_list(tab.svc.key)
+
+    @on(Input.Changed, ".output-dir-input")
+    def _handle_output_dir_changed(self, event: Input.Changed) -> None:
         if event.value.strip():
             self._cfg["defaults"]["output_dir"] = event.value.strip()
 
-    @on(Input.Changed, "#concurrency-input")
-    def _on_concurrency_changed(self, event: Input.Changed) -> None:
+    @on(Input.Changed, ".concurrency-input")
+    def _handle_concurrency_changed(self, event: Input.Changed) -> None:
         try:
             n = int(event.value)
         except ValueError:
             return
         if 1 <= n <= 32:
             self._cfg["defaults"]["concurrency"] = n
-            if not self._export_running:
+            if not any(t.export_running for t in self._tabs.values()):
                 self._semaphore = asyncio.Semaphore(n)
 
-    @on(SelectionList.SelectedChanged, "#exchange-user-list")
-    def _on_user_selection(self, event: SelectionList.SelectedChanged) -> None:
-        visible_ids    = {u["service_id"] for u in self._exchange_filtered}
+    @on(SelectionList.SelectedChanged, ".user-list")
+    def _handle_user_selection(self, event: SelectionList.SelectedChanged) -> None:
+        tab = self._tab_for(event.selection_list.id)
+        if not tab:
+            return
+        visible_ids    = {u["service_id"] for u in tab.filtered}
         newly_selected = set(event.selection_list.selected)
-        self._exchange_selected = (self._exchange_selected - visible_ids) | newly_selected
-        self._update_stats()
+        tab.selected   = (tab.selected - visible_ids) | newly_selected
+        self._update_stats(tab.svc.key)
 
-    @on(Button.Pressed, "#btn-all")
-    def _on_select_all(self) -> None:
-        self._exchange_selected |= {u["service_id"] for u in self._exchange_filtered}
-        self._refresh_user_list()
+    @on(Button.Pressed, ".btn-all")
+    def _handle_select_all(self, event: Button.Pressed) -> None:
+        tab = self._tab_for(event.button.id)
+        if tab:
+            tab.selected |= {u["service_id"] for u in tab.filtered}
+            self._refresh_user_list(tab.svc.key)
 
-    @on(Button.Pressed, "#btn-none")
-    def _on_select_none(self) -> None:
-        self._exchange_selected -= {u["service_id"] for u in self._exchange_filtered}
-        self._refresh_user_list()
+    @on(Button.Pressed, ".btn-none")
+    def _handle_select_none(self, event: Button.Pressed) -> None:
+        tab = self._tab_for(event.button.id)
+        if tab:
+            tab.selected -= {u["service_id"] for u in tab.filtered}
+            self._refresh_user_list(tab.svc.key)
 
-    @on(Button.Pressed, "#btn-start")
-    def _on_btn_start(self) -> None:
-        self.action_start_export()
+    @on(Button.Pressed, ".btn-start")
+    def _handle_btn_start(self, event: Button.Pressed) -> None:
+        tab = self._tab_for(event.button.id)
+        if tab:
+            self._start_export_for(tab.svc.key)
 
-    @on(Button.Pressed, "#btn-retry")
-    def _on_btn_retry(self) -> None:
-        self.action_retry_failed()
+    @on(Button.Pressed, ".btn-retry")
+    def _handle_btn_retry(self, event: Button.Pressed) -> None:
+        tab = self._tab_for(event.button.id)
+        if tab:
+            self._retry_failed_for(tab.svc.key)
 
     # ── Actions ───────────────────────────────────────────────────────────
 
+    def _active_service_key(self) -> str | None:
+        active = self.query_one(TabbedContent).active.removeprefix("tab-")
+        return active if active in self._tabs else None
+
     def action_start_export(self) -> None:
+        key = self._active_service_key()
+        if key:
+            self._start_export_for(key)
+
+    def _start_export_for(self, key: str) -> None:
+        tab = self._tabs[key]
         if not self._pw_context:
             self.notify("Session not ready yet — please wait.", severity="warning")
             return
-        if self._export_running:
+        if tab.export_running:
             self.notify("Export already running.", severity="warning")
             return
+        if self.winddown != "off":
+            self.notify(f"Wind-down active ({self.winddown}) — work will be deferred accordingly.",
+                        severity="warning")
 
-        selected = [
-            u for u in self._exchange_users
-            if u["service_id"] in self._exchange_selected
-        ]
+        selected = [u for u in tab.users if u["service_id"] in tab.selected]
         if not selected:
-            self.notify("No users selected.", severity="warning")
+            self.notify(f"No {tab.svc.noun_plural} selected.", severity="warning")
             return
 
-        selected   = _sort_users(selected, self._exchange_sort)
-        output_dir = Path(self._cfg["defaults"]["output_dir"]) / "exchange"
+        selected   = _sort_users(selected, tab.sort)
+        output_dir = Path(self._cfg["defaults"]["output_dir"]) / key
         output_dir.mkdir(parents=True, exist_ok=True)
         save_config(self._cfg)
 
-        self._export_running = True
-        self._run_pending    = {u["service_id"] for u in selected}
-        self.query_one("#btn-start", Button).disabled = True
+        tab.export_running = True
+        tab.run_pending    = {u["service_id"] for u in selected}
+        self.query_one(f"#{key}-btn-start", Button).disabled = True
 
-        table = self.query_one("#progress-table", DataTable)
+        table = self.query_one(f"#{key}-progress-table", DataTable)
         table.clear()
         for user in selected:
             table.add_row(
@@ -1655,46 +2103,79 @@ class BackupifyApp(App):
                 key=user["service_id"],
             )
 
-        self.post_message(StatusUpdate(f"⟳ Exporting {len(selected)} mailbox(es)…"))
-        self.post_message(LogEntry("info", f"Starting export for {len(selected)} user(s)…"))
-        self.run_preflight(selected, output_dir)
+        self.post_message(StatusUpdate(
+            f"⟳ Exporting {len(selected)} {tab.svc.noun}(s)…", service=key
+        ))
+        self.post_message(LogEntry(
+            "info", f"Starting export for {len(selected)} {tab.svc.noun}(s)…", service=key
+        ))
+        self.run_preflight(key, selected, output_dir)
 
     def action_refresh_users(self) -> None:
+        key = self._active_service_key()
+        if not key:
+            return
         if not self._pw_context:
             self.notify("Session not ready yet.", severity="warning")
             return
-        if USERS_FILE.exists():
-            USERS_FILE.unlink()
-        self.query_one("#exchange-user-list", SelectionList).loading = True
-        self.post_message(StatusUpdate("⟳ Re-fetching user list from Backupify…"))
-        self.post_message(LogEntry("info", "User cache cleared — re-fetching…"))
-        self.load_users()
+        tab        = self._tabs[key]
+        cache_file = entity_cache_path(tab.svc)
+        if cache_file.exists():
+            cache_file.unlink()
+        tab.users_loaded = False
+        self.post_message(StatusUpdate("⟳ Re-fetching entity list from Backupify…", service=key))
+        self.post_message(LogEntry("info", "Entity cache cleared — re-fetching…", service=key))
+        self._request_users_load(key)
 
     def action_retry_failed(self) -> None:
-        if not self._exchange_state:
+        key = self._active_service_key()
+        if key:
+            self._retry_failed_for(key)
+
+    def _retry_failed_for(self, key: str) -> None:
+        tab = self._tabs[key]
+        if not tab.state:
             return
-        n = len(self._exchange_state.state["failed"])
+        n = len(tab.state.state["failed"])
         if n == 0:
             self.notify("No failed exports to retry.")
             return
-        self._exchange_state.state["failed"].clear()
-        self._exchange_state.save()
-        self._export_running = False
-        self.query_one("#btn-start", Button).disabled = False
+        tab.state.state["failed"].clear()
+        tab.state.save()
+        tab.export_running = False
+        self.query_one(f"#{key}-btn-start", Button).disabled = False
         self.notify(f"Cleared {n} failed entr{'y' if n == 1 else 'ies'} — press Start to retry.")
-        self._refresh_user_list()
+        self._refresh_user_list(key)
 
-    def _finish_run(self) -> None:
-        self._export_running = False
-        self.query_one("#btn-start", Button).disabled = False
-        done   = len(self._exchange_state.state["completed"])
-        failed = len(self._exchange_state.state["failed"])
-        self.query_one("#status-text", Static).update(
-            f"✓ Run finished — {done} complete, {failed} failed."
-        )
-        self.post_message(LogEntry("info", f"Run finished — {done} complete, {failed} failed."))
+    def _finish_run(self, key: str) -> None:
+        tab = self._tabs[key]
+        tab.export_running = False
+        self.query_one(f"#{key}-btn-start", Button).disabled = False
+        done   = len(tab.state.state["completed"])
+        failed = len(tab.state.state["failed"])
+        self._set_status(f"✓ Run finished — {done} complete, {failed} failed.", key)
+        self.post_message(LogEntry(
+            "info", f"Run finished — {done} complete, {failed} failed.", service=key
+        ))
         self.notify(f"Run finished — {done} complete, {failed} failed.", title="Backupify")
-        self._refresh_user_list()
+        self._refresh_user_list(key)
+
+    def action_cycle_winddown(self) -> None:
+        keys = [k for k, _ in WINDDOWN_MODES]
+        idx  = (keys.index(self.winddown) + 1) % len(keys)
+        self.winddown, label = WINDDOWN_MODES[idx]
+        self.sub_title = "" if self.winddown == "off" else f"⏸ Wind-down: {label}"
+        self.notify(f"Wind-down: {label}", title="Backupify")
+        self.post_message(LogEntry("warning" if self.winddown != "off" else "info",
+                                   f"Wind-down mode: {label}"))
+
+    async def _ask_extend_poll(self, name: str, job_id: str) -> bool:
+        """Missing-job dialog (serialized — one at a time). True = keep waiting."""
+        waited_min = int(MISSING_FRESH_SCANS * POLL_INTERVAL / 60)
+        async with self._prompt_lock:
+            return bool(await self.push_screen_wait(
+                ExtendPollScreen(name, job_id, waited_min)
+            ))
 
     def action_quit(self) -> None:
         save_config(self._cfg)
@@ -1712,20 +2193,21 @@ class BackupifyApp(App):
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
-    def _refresh_user_list(self) -> None:
-        search = self._exchange_search.lower()
+    def _refresh_user_list(self, key: str) -> None:
+        tab    = self._tabs[key]
+        search = tab.search.lower()
         filtered = [
-            u for u in self._exchange_users
+            u for u in tab.users
             if not search
             or search in u["name"].lower()
             or search in (u.get("email") or "").lower()
         ]
-        self._exchange_filtered = _sort_users(filtered, self._exchange_sort)
+        tab.filtered = _sort_users(filtered, tab.sort)
 
-        sl    = self.query_one("#exchange-user-list", SelectionList)
-        state = self._exchange_state
+        sl    = self.query_one(f"#{key}-user-list", SelectionList)
+        state = tab.state
         sl.clear_options()
-        for user in self._exchange_filtered:
+        for user in tab.filtered:
             sid = user["service_id"]
             if state and state.is_done(sid):
                 label = f"✓ {user['name']}"
@@ -1735,13 +2217,14 @@ class BackupifyApp(App):
                 label = f"✗ {user['name']}"
             else:
                 label = f"  {user['name']}"
-            sl.add_option(Selection(label, sid, sid in self._exchange_selected))
+            sl.add_option(Selection(label, sid, sid in tab.selected))
 
-        self._update_stats()
+        self._update_stats(key)
 
-    def _update_stats(self) -> None:
-        state = self._exchange_state
-        total = len(self._exchange_users)
+    def _update_stats(self, key: str) -> None:
+        tab   = self._tabs[key]
+        state = tab.state
+        total = len(tab.users)
         if state:
             done    = len(state.state["completed"])
             in_prog = len(state.state["in_progress"])
@@ -1750,9 +2233,9 @@ class BackupifyApp(App):
         else:
             done = in_prog = failed = queued = 0
         try:
-            self.query_one("#user-stats", Static).update(
+            self.query_one(f"#{key}-user-stats", Static).update(
                 f"✓ {done}  ⟳ {in_prog}  ✗ {failed}  ○ {queued}"
-                f"  │  {len(self._exchange_selected)}/{total} selected"
+                f"  │  {len(tab.selected)}/{total} selected"
             )
         except Exception:
             pass
