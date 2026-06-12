@@ -86,6 +86,9 @@ _DEFAULT_CONFIG: dict = {
     "defaults": {
         "concurrency": 8,
         "output_dir":  str(Path.home() / "backupify_exports"),
+        # Completed exports count against a server-side storage quota — once
+        # the archive is safely on disk, hit the row's Delete link to free it.
+        "delete_after_download": True,
     },
 }
 
@@ -237,6 +240,9 @@ EXPORT_TIMEOUT   = 10_800       # max wait for one export job (3 h)
 # gets enough scans to ride out a slow page before we re-trigger.
 MISSING_FRESH_SCANS   = 120     # fresh trigger:  ~60 min at POLL_INTERVAL=30s
 MISSING_RESUMED_SCANS = 20      # resumed job id: ~10 min, then re-trigger
+EXTEND_PROMPT_TIMEOUT = 120     # unanswered missing-job dialog auto-picks
+                                # "keep waiting" after this many seconds, so an
+                                # unattended run never stalls on the prompt
 DOWNLOAD_TIMEOUT = 7_200        # max read time for one download (2 h)
 CHUNK_SIZE       = 16 * 1024 * 1024
 
@@ -1072,6 +1078,60 @@ async def download_file(
         return None
 
 
+def _delete_url_from_download(download_url: str) -> str | None:
+    """
+    The export row's Download and Delete links differ only in the path verb:
+        …/<cid>/download?type=export&appType=X&id=Y&ext=Z
+        …/<cid>/delete?type=export&appType=X&id=Y
+    """
+    if "/download?" not in download_url:
+        return None
+    url = download_url.replace("/download?", "/delete?", 1)
+    return re.sub(r"&ext=[^&]*", "", url)
+
+
+async def delete_server_export(
+    download_url: str,
+    cookies: dict,
+    logger: logging.Logger,
+    source_name: str,
+) -> bool:
+    """
+    Best-effort: hits the export row's Delete link so the finished archive
+    stops counting against the server-side export-storage quota.  Returns
+    True on success; never raises — a failed delete must not fail the entity.
+    """
+    url = _delete_url_from_download(download_url)
+    if not url:
+        logger.warning(
+            f"{source_name}: can't derive delete URL from "
+            f"{download_url[:80]} — export left on server."
+        )
+        return False
+    if url.startswith("/"):
+        url = BASE_URL + url
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=60.0) as client:
+            resp = await client.get(
+                url,
+                headers={
+                    "Cookie":     cookie_header,
+                    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+                },
+            )
+        if resp.status_code < 400:
+            logger.info(f"{source_name}: server-side export deleted.")
+            return True
+        logger.warning(
+            f"{source_name}: delete returned HTTP {resp.status_code} — export left on server."
+        )
+        return False
+    except httpx.RequestError as e:
+        logger.warning(f"{source_name}: delete request failed: {e}")
+        return False
+
+
 # ─── TUI — sort helpers ───────────────────────────────────────────────────────
 
 _SORT_OPTIONS = [
@@ -1390,13 +1450,18 @@ WINDDOWN_MODES: list[tuple[str, str]] = [
 
 
 class ExtendPollScreen(ModalScreen[bool]):
-    """'Export job still hasn't appeared — keep waiting?' dialog."""
+    """'Export job still hasn't appeared — keep waiting?' dialog.
+
+    Auto-answers "keep waiting" after EXTEND_PROMPT_TIMEOUT seconds so an
+    unattended run never stalls holding a concurrency slot.
+    """
 
     def __init__(self, entity_name: str, job_id: str, waited_min: int) -> None:
         super().__init__()
         self._entity_name = entity_name
         self._job_id      = job_id
         self._waited_min  = waited_min
+        self._remaining   = EXTEND_PROMPT_TIMEOUT
 
     def compose(self) -> ComposeResult:
         with Vertical(id="extend-dialog"):
@@ -1408,10 +1473,31 @@ class ExtendPollScreen(ModalScreen[bool]):
                 "job — it may well still be queued server-side.",
                 id="extend-body",
             )
+            yield Static(self._countdown_text(), id="extend-countdown")
             with Horizontal(id="extend-buttons"):
                 yield Button(f"Keep waiting (+{self._waited_min} min)",
                              variant="primary", id="extend-wait")
                 yield Button("Give up (mark failed)", variant="error", id="extend-fail")
+
+    def on_mount(self) -> None:
+        self.set_interval(1.0, self._tick)
+
+    def _countdown_text(self) -> str:
+        m, s = divmod(self._remaining, 60)
+        return f"No answer in {m}:{s:02d} → keeps waiting automatically."
+
+    def _tick(self) -> None:
+        self._remaining -= 1
+        if self._remaining <= 0:
+            self.app.post_message(LogEntry(
+                "warning",
+                f"{self._entity_name}: missing-job prompt unanswered for "
+                f"{EXTEND_PROMPT_TIMEOUT // 60} min — auto-extending wait "
+                f"for job {self._job_id}.",
+            ))
+            self.dismiss(True)
+        else:
+            self.query_one("#extend-countdown", Static).update(self._countdown_text())
 
     @on(Button.Pressed, "#extend-wait")
     def _handle_extend_wait(self) -> None:
@@ -1518,6 +1604,7 @@ class BackupifyApp(App):
     }
     #extend-title   { text-style: bold; }
     #extend-body    { padding: 1 0; }
+    #extend-countdown { color: $text-muted; padding-bottom: 1; }
     #extend-buttons { height: auto; align: center middle; }
     #extend-buttons Button { margin: 0 1; }
     """
@@ -1528,6 +1615,7 @@ class BackupifyApp(App):
         Binding("f5",     "refresh_users",  "Refresh Users"),
         Binding("ctrl+r", "retry_failed",   "Retry Failed"),
         Binding("ctrl+w", "cycle_winddown", "Wind-down"),
+        Binding("ctrl+d", "purge_server",   "Purge Server"),
     ]
 
     def __init__(self, cfg: dict) -> None:
@@ -1880,6 +1968,22 @@ class BackupifyApp(App):
                     state.mark_complete(sid, filename)
                     self.post_message(ExportUpdate(key, sid, "complete", filename[:38]))
                     self.post_message(LogEntry("success", f"✓ {name}  →  {filename}", service=key))
+                    # Completed exports count against a server-side storage
+                    # quota — clean up now that the archive is on disk.
+                    if self._cfg["defaults"].get("delete_after_download", True):
+                        if await delete_server_export(
+                            download_url, self._cookies, self._bfy_logger, name
+                        ):
+                            self.post_message(LogEntry(
+                                "info", f"{name}: server-side export deleted.", service=key
+                            ))
+                        else:
+                            self.post_message(LogEntry(
+                                "warning",
+                                f"{name}: couldn't delete server-side export — "
+                                "remove it manually to free quota.",
+                                service=key,
+                            ))
                 else:
                     state.mark_failed(sid, "Download failed")
                     self.post_message(ExportUpdate(key, sid, "failed", "download error"))
@@ -2131,6 +2235,87 @@ class BackupifyApp(App):
         key = self._active_service_key()
         if key:
             self._retry_failed_for(key)
+
+    def action_purge_server(self) -> None:
+        key = self._active_service_key()
+        if not key:
+            return
+        if not self._pw_context:
+            self.notify("Session not ready yet.", severity="warning")
+            return
+        tab = self._tabs[key]
+        if not tab.users_loaded:
+            self.notify("Entity list still loading — try again shortly.", severity="warning")
+            return
+        self.purge_server_exports(key)
+
+    @work(group="purge", exclusive=True)
+    async def purge_server_exports(self, key: str) -> None:
+        """
+        One-shot cleanup: delete every completed server-side export whose
+        archive is already on disk, freeing the export-storage quota.
+
+        The export page identifies rows by source name only, so a row is only
+        purged when the name maps to exactly ONE known entity (same uniqueness
+        guard as export adoption) and that entity's file exists locally.
+        Mid-download entities are safe: .part files don't count as existing.
+        """
+        tab        = self._tabs[key]
+        svc        = tab.svc
+        output_dir = Path(self._cfg["defaults"]["output_dir"]) / key
+
+        self.post_message(StatusUpdate("⟳ Purge: scanning export page…", service=key))
+        self.post_message(LogEntry("info", "Purge: scanning export page…", service=key))
+        try:
+            async with _export_scan_locks[svc.key]:
+                await refresh_export_cache(self._pw_context, svc, self._bfy_logger)
+        except Exception as exc:
+            self.post_message(LogEntry(
+                "error", f"Purge aborted — export page scan failed: {exc}", service=key
+            ))
+            self.post_message(StatusUpdate("✗ Purge aborted — scan failed.", service=key))
+            return
+
+        name_counts: dict[str, int] = {}
+        by_name:     dict[str, dict] = {}
+        for u in tab.users:
+            n = u.get("name")
+            name_counts[n] = name_counts.get(n, 0) + 1
+            by_name[n] = u
+
+        rows = [r for r in _export_caches[svc.key].values()
+                if r["status"] == "completed" and r["download_url"]]
+        deleted = failed = 0
+        not_local = ambiguous = 0
+        for r in rows:
+            name = r["source_name"]
+            user = by_name.get(name)
+            if not user or name_counts.get(name, 0) != 1:
+                ambiguous += 1
+                continue
+            if not find_existing_export(output_dir, name, user["service_id"]):
+                not_local += 1
+                continue
+            if await delete_server_export(
+                r["download_url"], self._cookies, self._bfy_logger, name
+            ):
+                deleted += 1
+                # Drop the row so adoption can't pick up the deleted export.
+                _export_caches[svc.key].pop(r["job_id"], None)
+                self.post_message(LogEntry(
+                    "info", f"Purge: deleted server export for {name} (job {r['job_id']}).",
+                    service=key,
+                ))
+            else:
+                failed += 1
+
+        summary = (
+            f"Purge done — {deleted} deleted, {failed} failed, "
+            f"{not_local} not downloaded, {ambiguous} unknown/ambiguous name."
+        )
+        self.post_message(LogEntry("warning" if failed else "info", summary, service=key))
+        self.post_message(StatusUpdate(f"✓ {summary}", service=key))
+        self.notify(summary, title="Backupify")
 
     def _retry_failed_for(self, key: str) -> None:
         tab = self._tabs[key]
